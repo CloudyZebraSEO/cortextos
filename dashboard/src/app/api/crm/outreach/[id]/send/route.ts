@@ -30,7 +30,18 @@ interface RunResult {
 
 function runScript(args: string[]): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn('node', [SCRIPT_PATH, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // The dashboard PM2 process runs under a different CTX_AGENT_NAME (sentinel).
+    // execute-crm-outreach.js reads the Skool storage_state from
+    // $CTX_ROOT/state/$CTX_AGENT_NAME/skool-state.json, so override to skoolio
+    // for this spawn — the script is skoolio-specific by design.
+    const child = spawn('node', [SCRIPT_PATH, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CTX_AGENT_NAME: 'skoolio',
+        CTX_ROOT: process.env.CTX_ROOT || path.join(process.env.HOME || '/', '.cortextos', 'default'),
+      },
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d.toString(); });
