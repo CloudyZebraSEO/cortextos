@@ -180,7 +180,7 @@ export interface AgentConfig {
    * NousResearch/hermes-agent) with Hermes-specific bootstrap, session
    * continuity, and exit handling.
    */
-  runtime?: 'claude-code' | 'hermes';
+  runtime?: 'claude-code' | 'hermes' | 'codex';
 }
 
 export interface CronEntry {
