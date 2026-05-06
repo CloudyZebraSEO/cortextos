@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { AgentPTY } from './agent-pty.js';
 import { OutputBuffer } from './output-buffer.js';
+import type { TelegramAPI } from '../telegram/api.js';
 
 // node-pty types (same as agent-pty.ts)
 interface IPty {
@@ -52,6 +53,13 @@ export class CodexPTY {
   private _config: AgentConfig;
   private _stateDir: string;
   private _cwd: string;
+  // Issue #330: direct typing-indicator firing from the JSONL stream.
+  // Without this CodexPTY relied on fast-checker's last_idle.flag mechanism,
+  // which races on short turns: idle flag lands before the typing pollCycle
+  // wakes, so the user never sees "typing..." for fast codex turns.
+  private _telegramApi: TelegramAPI | null = null;
+  private _chatId: string | null = null;
+  private _typingLastSent = 0;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
     this._env = env;
@@ -158,6 +166,17 @@ export class CodexPTY {
   }
 
   /**
+   * Provide the Telegram API handle + chatId used to fire typing indicators
+   * directly from the JSONL stream (issue #330). Called by AgentProcess when
+   * the daemon has loaded the agent's bot credentials. Without this, typing
+   * still falls back to fast-checker's last_idle.flag path.
+   */
+  setTelegramHandle(api: TelegramAPI, chatId: string): void {
+    this._telegramApi = api;
+    this._chatId = chatId;
+  }
+
+  /**
    * Queue a message for exec. Starts draining immediately if not already running.
    */
   private queueExec(message: string): void {
@@ -215,6 +234,9 @@ export class CodexPTY {
         // Detect turn.completed in JSONL output → write last_idle.flag
         if (data.includes('"turn.completed"') || data.includes('"type":"turn.completed"')) {
           this.writeIdleFlag();
+        } else if (data.includes('"type":"')) {
+          // Issue #330: any other JSONL event during the turn → fire typing
+          this.maybeFireTyping();
         }
       });
 
@@ -239,6 +261,20 @@ export class CodexPTY {
       const flagPath = join(this._stateDir, 'last_idle.flag');
       writeFileSync(flagPath, Math.floor(Date.now() / 1000).toString(), 'utf-8');
     } catch { /* non-fatal */ }
+  }
+
+  /**
+   * Fire a Telegram "typing..." indicator, rate-limited to one call per 4s
+   * (matches fast-checker.sendTyping cadence; Telegram clears the indicator
+   * automatically after ~5s, so 4s spacing keeps it on continuously).
+   * No-op when the Telegram handle hasn't been wired in.
+   */
+  private maybeFireTyping(): void {
+    if (!this._telegramApi || !this._chatId) return;
+    const now = Date.now();
+    if (now - this._typingLastSent < 4000) return;
+    this._typingLastSent = now;
+    this._telegramApi.sendChatAction(this._chatId, 'typing').catch(() => { /* non-fatal */ });
   }
 
   /**

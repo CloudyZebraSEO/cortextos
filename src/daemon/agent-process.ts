@@ -6,6 +6,7 @@ import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexPTY } from '../pty/codex-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { MessageDedup, injectMessage } from '../pty/inject.js';
+import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
@@ -53,6 +54,10 @@ export class AgentProcess {
   private dedup: MessageDedup;
   private log: LogFn;
   private onStatusChange: ((status: AgentStatus) => void) | null = null;
+  // Issue #330: held here so CodexPTY can be re-wired across session refresh
+  // (each start() recreates the PTY, but the Telegram handle persists).
+  private telegramApi: TelegramAPI | null = null;
+  private telegramChatId: string | null = null;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -114,6 +119,13 @@ export class AgentProcess {
       : this.config.runtime === 'codex'
         ? new CodexPTY(this.env, this.config, logPath)
         : new AgentPTY(this.env, this.config, logPath);
+
+    // Issue #330: re-wire the Telegram handle on every start() (session refresh
+    // creates a fresh CodexPTY). Only CodexPTY uses this — Claude / Hermes
+    // typing indicators flow through fast-checker.
+    if (this.config.runtime === 'codex' && this.telegramApi && this.telegramChatId) {
+      (this.pty as CodexPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
+    }
 
     // BUG-011 fix: create a fresh exit signal for this run. resolveExit is
     // called from the onExit handler below; stop() awaits exitPromise to
@@ -298,6 +310,19 @@ export class AgentProcess {
    */
   onStatusChanged(handler: (status: AgentStatus) => void): void {
     this.onStatusChange = handler;
+  }
+
+  /**
+   * Wire the agent's Telegram bot handle. Used by CodexPTY (issue #330) to
+   * fire sendChatAction directly from the JSONL stream. Safe to call before
+   * or after start() — the handle is re-applied on every PTY (re)spawn.
+   */
+  setTelegramHandle(api: TelegramAPI, chatId: string): void {
+    this.telegramApi = api;
+    this.telegramChatId = chatId;
+    if (this.config.runtime === 'codex' && this.pty) {
+      (this.pty as CodexPTY).setTelegramHandle(api, chatId);
+    }
   }
 
   /**
