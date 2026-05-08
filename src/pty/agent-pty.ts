@@ -193,7 +193,22 @@ export class AgentPTY {
    * Protected so HermesPTY can override to return 'hermes'.
    */
   protected getBinaryName(): string {
-    return platform() === 'win32' ? 'claude.cmd' : 'claude';
+    if (platform() !== 'win32') return 'claude';
+    // On Windows, the Claude Code installer historically shipped a `claude.cmd`
+    // shim alongside `claude.exe`. Newer installers ship only `claude.exe`
+    // (e.g. when installed under `~/.local/bin`). Probe PATH for whichever is
+    // present and prefer the native `.exe` when available — it spawns more
+    // cleanly under node-pty/ConPTY than a .cmd wrapper.
+    const pathDirs = (process.env.PATH || '').split(';').filter(Boolean);
+    for (const ext of ['.exe', '.cmd']) {
+      for (const dir of pathDirs) {
+        if (existsSync(join(dir, `claude${ext}`))) {
+          return `claude${ext}`;
+        }
+      }
+    }
+    // Fallback to legacy default if neither was found on PATH.
+    return 'claude.cmd';
   }
 
   /**
