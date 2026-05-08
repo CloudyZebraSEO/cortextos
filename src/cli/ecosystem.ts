@@ -95,6 +95,12 @@ export const ecosystemCommand = new Command('ecosystem')
     const dashboardScript = isWindows && existsSync(nextBin) ? nextBin : 'npm';
     const dashboardArgs = isWindows && existsSync(nextBin) ? 'dev' : 'run dev';
 
+    // windowsHide: stops PM2 from attaching a visible "next-server" console
+    // window to the dashboard process at boot on Windows. PM2's default
+    // CreateProcess flags include the parent console; on Linux/macOS the
+    // process is already daemonized so this is invisible. Harmless if true
+    // on non-Windows (PM2 ignores the flag). Surfaces as a stray terminal
+    // titled "next-server (vX.Y.Z)" after `pm2 resurrect` post-reboot.
     const dashboardAppBlock = hasDashboard
       ? `,
     {
@@ -107,6 +113,7 @@ export const ecosystemCommand = new Command('ecosystem')
       },
       // Dashboard reads its real config from dashboard/.env.local — populated
       // by /onboarding Phase 7. PM2 just supervises the dashboard process.
+      windowsHide: true,
       max_restarts: 50,
       restart_delay: 5000,
       autorestart: true,
