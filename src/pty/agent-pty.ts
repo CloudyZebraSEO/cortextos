@@ -194,11 +194,15 @@ export class AgentPTY {
    */
   protected getBinaryName(): string {
     if (platform() !== 'win32') return 'claude';
-    // On Windows, the Claude Code installer historically shipped a `claude.cmd`
-    // shim alongside `claude.exe`. Newer installers ship only `claude.exe`
-    // (e.g. when installed under `~/.local/bin`). Probe PATH for whichever is
-    // present and prefer the native `.exe` when available — it spawns more
-    // cleanly under node-pty/ConPTY than a .cmd wrapper.
+    // The Claude Code Windows installer historically shipped a `claude.cmd`
+    // shim alongside `claude.exe`. Newer installers (e.g. when claude lives
+    // under `~/.local/bin`) ship only `claude.exe` and have no `.cmd` shim.
+    // Hardcoding `claude.cmd` causes node-pty/ConPTY to fail with an empty
+    // "File not found" error before the agent ever boots.
+    //
+    // Probe PATH for whichever extension is present and prefer `.exe` —
+    // it spawns more cleanly under ConPTY than a `.cmd` wrapper, and matches
+    // what `where.exe claude` returns on current installs.
     const pathDirs = (process.env.PATH || '').split(';').filter(Boolean);
     for (const ext of ['.exe', '.cmd']) {
       for (const dir of pathDirs) {
@@ -207,7 +211,8 @@ export class AgentPTY {
         }
       }
     }
-    // Fallback to legacy default if neither was found on PATH.
+    // Neither found on PATH — fall back to the legacy default so the error
+    // message from node-pty surfaces a recognizable filename for debugging.
     return 'claude.cmd';
   }
 
@@ -318,7 +323,14 @@ export class AgentPTY {
     const keepVars = [
       'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
       'TMPDIR', 'TEMP', 'TMP', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
-      'NODE_PATH', 'COMSPEC', 'SystemRoot', 'USERPROFILE',
+      'NODE_PATH', 'COMSPEC', 'USERPROFILE',
+      // Windows path-expansion essentials. Stripping these causes phantom
+      // %SystemDrive% directories from inherited Search Indexer processes
+      // and Unity batchmode UPM IPC crashes (path.join(undefined,...)).
+      'SystemDrive', 'SystemRoot', 'windir',
+      'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ALLUSERSPROFILE',
+      'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+      'HOMEDRIVE', 'HOMEPATH', 'PUBLIC',
     ];
     for (const key of keepVars) {
       if (process.env[key]) {
