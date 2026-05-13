@@ -358,23 +358,27 @@ export function syncCostsLazy(): void {
 // ---------------------------------------------------------------------------
 
 export function syncFile(filePath: string): void {
-  if (filePath.includes('/tasks/') && filePath.endsWith('.json')) {
-    const org = extractOrgFromPath(filePath);
+  // Normalize Windows backslashes to forward slashes so the substring + regex
+  // matchers below work cross-platform. path.join produces native separators,
+  // so dashboard tests on Windows would otherwise silently no-op.
+  const p = filePath.replace(/\\/g, '/');
+  if (p.includes('/tasks/') && p.endsWith('.json')) {
+    const org = extractOrgFromPath(p);
     if (org) syncTasks(org);
-  } else if (filePath.includes('/approvals/') && filePath.endsWith('.json')) {
-    const org = extractOrgFromPath(filePath);
+  } else if (p.includes('/approvals/') && p.endsWith('.json')) {
+    const org = extractOrgFromPath(p);
     if (org) syncApprovals(org);
   } else if (
-    filePath.includes('/analytics/events/') &&
-    filePath.endsWith('.jsonl')
+    p.includes('/analytics/events/') &&
+    p.endsWith('.jsonl')
   ) {
-    const { org, agent } = extractOrgAndAgentFromEventPath(filePath);
+    const { org, agent } = extractOrgAndAgentFromEventPath(p);
     if (org && agent) syncEvents(org, agent);
   } else if (
-    filePath.includes('/state/') &&
-    filePath.endsWith('heartbeat.json')
+    p.includes('/state/') &&
+    p.endsWith('heartbeat.json')
   ) {
-    const agent = extractAgentFromStatePath(filePath);
+    const agent = extractAgentFromStatePath(p);
     if (agent) syncHeartbeat(agent);
   }
 }
