@@ -199,8 +199,6 @@ export class FastChecker {
         if (hasTelegramMessage) {
           this.lastMessageInjectedAt = Date.now();
         }
-        // Cooldown after injection
-        await sleep(5000);
       }
     }
 
