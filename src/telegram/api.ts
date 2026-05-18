@@ -354,13 +354,22 @@ export class TelegramAPI {
 
   /**
    * Get updates via long polling.
+   *
+   * @param offset   exclusive cursor — only updates with update_id >= offset are returned
+   * @param limit    max updates to return in this batch (Telegram caps at 100)
+   * @param timeout  server-side long-poll timeout in seconds. 0 = short poll;
+   *                 >0 = the server holds the connection until an update arrives
+   *                 or `timeout` seconds elapse. We override the client-side abort
+   *                 to `(timeout * 1000) + 5000` so we never abort before Telegram does.
    */
-  async getUpdates(offset: number, timeout: number = 1): Promise<any> {
+  async getUpdates(offset: number, limit: number = 1, timeout: number = 0): Promise<any> {
+    const clientTimeoutMs = timeout > 0 ? (timeout * 1000) + 5000 : 15000;
     return this.post('getUpdates', {
       offset,
+      limit,
       timeout,
       allowed_updates: ['message', 'callback_query', 'message_reaction'],
-    });
+    }, clientTimeoutMs);
   }
 
   /**
@@ -570,14 +579,19 @@ export class TelegramAPI {
 
   /**
    * Make a POST request to the Telegram API.
+   *
+   * @param timeoutMs optional per-call abort timeout. Defaults to 15s for
+   *   short-lived requests (sendMessage, getMe, etc). Long-polling callers
+   *   (getUpdates with timeout > 0) MUST raise this above the server-side
+   *   long-poll timeout, or the local abort fires before Telegram returns.
    */
-  private async post(method: string, data: object): Promise<any> {
+  private async post(method: string, data: object, timeoutMs: number = 15000): Promise<any> {
     try {
       const response = await fetch(`${this.baseUrl}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       const result = await response.json() as any;
       if (!result.ok) {
@@ -592,7 +606,7 @@ export class TelegramAPI {
       // Surface as a clean retryable error so the poller loop recovers next tick
       // instead of silently hanging on a wedged TCP connection.
       if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-        throw new Error(`Telegram API request timed out after 15s: ${method}`);
+        throw new Error(`Telegram API request timed out after ${timeoutMs}ms: ${method}`);
       }
       throw new Error(`Telegram API request failed: ${err}`);
     }

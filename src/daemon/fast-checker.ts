@@ -111,7 +111,7 @@ export class FastChecker {
     const agentName = this.agent.name;
     this.heartbeatTimer = setInterval(() => {
       const ts = new Date().toISOString();
-      execFile('cortextos', ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], (err) => {
+      execFile('cortextos', ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], { windowsHide: true }, (err) => {
         if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
       });
     }, HEARTBEAT_INTERVAL_MS);
@@ -199,8 +199,6 @@ export class FastChecker {
         if (hasTelegramMessage) {
           this.lastMessageInjectedAt = Date.now();
         }
-        // Cooldown after injection
-        await sleep(5000);
       }
     }
 

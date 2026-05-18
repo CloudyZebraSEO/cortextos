@@ -5,9 +5,23 @@
       "Read",
       "Edit",
       "Write",
+      "Glob",
+      "Grep",
       "WebFetch",
-      "WebSearch"
+      "WebSearch",
+      "ToolSearch",
+      "CronCreate",
+      "CronList",
+      "CronDelete",
+      "Skill",
+      "Agent"
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "cortextos bus hook-context-status",
+    "refreshInterval": 5,
+    "timeout": 2
   },
   "hooks": {
     "PermissionRequest": [

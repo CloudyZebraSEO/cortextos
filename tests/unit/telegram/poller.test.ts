@@ -75,8 +75,9 @@ describe('TelegramPoller — offset-after-handler', () => {
       throw new Error('inject failed');
     });
 
-    // Handler errors are caught internally — pollOnce should not throw.
-    await expect(poller.pollOnce()).resolves.toBeUndefined();
+    // Handler errors are caught internally — pollOnce should not throw,
+    // and should still report that an update was received (boolean return).
+    await expect(poller.pollOnce()).resolves.toBe(true);
 
     // Offset file must not exist (or must still be 0) — update should redeliver.
     const offsetFile = join(stateDir, '.telegram-offset');

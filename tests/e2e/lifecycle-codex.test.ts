@@ -20,8 +20,16 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir, platform } from 'os';
 import { WsUnixJsonRpcClient } from '../../src/utils/ws-unix-client.js';
+
+// Windows skip: Node.js AF_UNIX binds reliably fail with EACCES across all
+// writable paths on Windows 10/11 — verified empirically (EACCES at C:\,
+// %TEMP%, %USERPROFILE%, and project cwd). A real Windows-native codex
+// runtime requires a named-pipe transport (\\.\pipe\...) on the product
+// side — tracked in reports/codex-windows-compat-followups.md §1. Until
+// that ships, run codex E2E tests via WSL or Linux/macOS CI.
+const describeOrSkip = platform() === 'win32' ? describe.skip : describe;
 
 const { MockCodexServer } = require('./mock-codex.js') as {
   MockCodexServer: new (options: {
@@ -41,7 +49,7 @@ interface MockCodexServerInstance {
   requestLog: Array<{ method: string; params: unknown; notification?: boolean }>;
 }
 
-describe('E2E codex lifecycle (mock-codex.js + WsUnixJsonRpcClient)', () => {
+describeOrSkip('E2E codex lifecycle (mock-codex.js + WsUnixJsonRpcClient)', () => {
   let testDir: string;
   let socketPath: string;
   let server: MockCodexServerInstance;

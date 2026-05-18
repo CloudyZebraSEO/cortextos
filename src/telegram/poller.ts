@@ -4,9 +4,16 @@ import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery, TelegramMe
 import { TelegramAPI } from './api.js';
 import { ensureDir } from '../utils/atomic.js';
 
-export type MessageHandler = (msg: TelegramMessage) => void;
-export type CallbackHandler = (query: TelegramCallbackQuery) => void;
-export type ReactionHandler = (reaction: TelegramMessageReaction) => void;
+export type MessageHandler = (msg: TelegramMessage) => void | Promise<void>;
+export type CallbackHandler = (query: TelegramCallbackQuery) => void | Promise<void>;
+export type ReactionHandler = (reaction: TelegramMessageReaction) => void | Promise<void>;
+
+// Max updates returned per getUpdates batch. Telegram caps at 100.
+const BATCH_LIMIT = 100;
+// Server-side long-poll timeout in seconds. Telegram holds the connection
+// until an update arrives or this elapses. Client abort is set to
+// (timeout * 1000) + 5000 ms by TelegramAPI.getUpdates.
+const LONG_POLL_TIMEOUT_SECONDS = 25;
 
 /**
  * Telegram polling loop. Replaces the Telegram portion of fast-checker.sh.
@@ -73,17 +80,24 @@ export class TelegramPoller {
 
   /**
    * Start the polling loop.
+   *
+   * Uses Telegram long-polling: getUpdates holds the connection up to
+   * LONG_POLL_TIMEOUT_SECONDS and returns instantly when an update arrives.
+   * This replaces the prior short-poll + 1s sleep pattern. A short backoff
+   * is still applied on empty/error cycles to avoid hot-looping a wedged API.
    */
   async start(): Promise<void> {
     this.running = true;
     while (this.running) {
+      let backoffMs = 0;
       try {
-        await this.pollOnce();
+        const hadUpdate = await this.pollOnce();
+        if (!hadUpdate) backoffMs = 100;
       } catch (err) {
-        // Log error but continue polling
         console.error('[telegram-poller] Poll error:', err);
+        backoffMs = 1000;
       }
-      await sleep(this.pollInterval);
+      if (backoffMs > 0) await sleep(backoffMs);
     }
   }
 
@@ -104,9 +118,9 @@ export class TelegramPoller {
    * to preserve ordering. The offset is persisted after each successful
    * update so a crash mid-batch does not drop confirmed state.
    */
-  async pollOnce(): Promise<void> {
-    const result = await this.api.getUpdates(this.offset, 1);
-    if (!result?.result?.length) return;
+  async pollOnce(): Promise<boolean> {
+    const result = await this.api.getUpdates(this.offset, BATCH_LIMIT, LONG_POLL_TIMEOUT_SECONDS);
+    if (!result?.result?.length) return false;
 
     for (const update of result.result as TelegramUpdate[]) {
       const nextOffset = update.update_id + 1;
@@ -115,7 +129,7 @@ export class TelegramPoller {
       if (update.message) {
         for (const handler of this.messageHandlers) {
           try {
-            handler(update.message);
+            await handler(update.message);
           } catch (err) {
             console.error('[telegram-poller] Message handler error:', err);
             handlerFailed = true;
@@ -127,7 +141,7 @@ export class TelegramPoller {
       if (!handlerFailed && update.callback_query) {
         for (const handler of this.callbackHandlers) {
           try {
-            handler(update.callback_query);
+            await handler(update.callback_query);
           } catch (err) {
             console.error('[telegram-poller] Callback handler error:', err);
             handlerFailed = true;
@@ -139,7 +153,7 @@ export class TelegramPoller {
       if (!handlerFailed && update.message_reaction) {
         for (const handler of this.reactionHandlers) {
           try {
-            handler(update.message_reaction);
+            await handler(update.message_reaction);
           } catch (err) {
             console.error('[telegram-poller] Reaction handler error:', err);
             handlerFailed = true;
@@ -151,12 +165,13 @@ export class TelegramPoller {
       if (handlerFailed) {
         // Do not advance offset — the update will be redelivered.
         // Stop processing the rest of this batch to preserve ordering.
-        return;
+        return true;
       }
 
       this.offset = nextOffset;
       this.saveOffset();
     }
+    return true;
   }
 
   /**

@@ -25,7 +25,9 @@ describe('TelegramAPI fetch timeout', () => {
     ) as any;
 
     const api = new TelegramAPI('123:TEST');
-    await expect(api.getUpdates(0, 1)).rejects.toThrow(/timed out after 15s/);
+    // getUpdates with timeout=0 uses the default 15000ms client timeout;
+    // long-poll variants override via the per-call timeout in TelegramAPI.post().
+    await expect(api.getUpdates(0, 1, 0)).rejects.toThrow(/timed out after 15000ms/);
   }, 20000);
 
   it('succeeds on normal fetch response', async () => {

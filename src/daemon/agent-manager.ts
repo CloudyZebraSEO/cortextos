@@ -316,7 +316,7 @@ export class AgentManager {
       const stateDir = join(this.ctxRoot, 'state', name);
       const poller = new TelegramPoller(telegramApi, stateDir);
 
-      poller.onMessage((msg) => {
+      poller.onMessage(async (msg) => {
         // ALLOWED_USER gate: if configured, ignore messages from other users.
         // Use numeric comparison to avoid string coercion issues.
         if (allowedUserId) {
@@ -346,7 +346,8 @@ export class AgentManager {
 
         if (isMedia && telegramApi) {
           const downloadDir = join(agentDir, 'telegram-images');
-          processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
+          try {
+            const media = await processMediaMessage(msg, telegramApi, downloadDir);
             if (!media) {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
@@ -384,12 +385,12 @@ export class AgentManager {
             }
             log(`Media message received: type=${media.type}, path=${media.image_path || media.file_path}`);
             checker.queueTelegramMessage(formatted);
-          }).catch((err) => {
+          } catch (err) {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
             const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
             if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
-          });
+          }
           return;
         }
 
