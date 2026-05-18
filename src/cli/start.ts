@@ -62,6 +62,7 @@ export const startCommand = new Command('start')
         const child = spawn(process.execPath, [daemonScript, '--instance', options.instance], {
           stdio: 'inherit',
           env: daemonEnv,
+          windowsHide: true,
         });
         child.on('exit', (code) => process.exit(code || 0));
         process.on('SIGINT', () => child.kill('SIGTERM'));
