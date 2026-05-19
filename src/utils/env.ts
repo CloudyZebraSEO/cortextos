@@ -89,9 +89,18 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
   // agent shell while only CTX_FRAMEWORK_ROOT was overridden — agentDir then silently
   // points at the live install. Equality check on projectRoot vs frameworkRoot catches
   // the same divergence on the projectRoot axis.
+  //
+  // Windows note: file-system paths are case-insensitive on Windows but Node's
+  // path.resolve returns whatever casing the user supplied. A bare startsWith()
+  // compare therefore false-positives the canary when the same logical path is
+  // referenced with different casing (e.g. 'C:\Users\Steve' vs 'C:\users\steve').
+  // Fold case on win32 only — case still matters on Linux/macOS where 'foo' and
+  // 'Foo' are genuinely different paths.
+  const foldPath = (p: string): string =>
+    process.platform === 'win32' ? p.toLowerCase() : p;
   if (agentDir && frameworkRoot) {
-    const fwRootResolved = resolvePath(frameworkRoot);
-    const agentDirResolved = resolvePath(agentDir);
+    const fwRootResolved = foldPath(resolvePath(frameworkRoot));
+    const agentDirResolved = foldPath(resolvePath(agentDir));
     if (agentDirResolved !== fwRootResolved && !agentDirResolved.startsWith(fwRootResolved + sep)) {
       throw new Error(
         `Resolved CTX_AGENT_DIR '${agentDir}' is not under CTX_FRAMEWORK_ROOT '${frameworkRoot}'. ` +
@@ -101,7 +110,7 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
       );
     }
   }
-  if (projectRoot && frameworkRoot && resolvePath(projectRoot) !== resolvePath(frameworkRoot)) {
+  if (projectRoot && frameworkRoot && foldPath(resolvePath(projectRoot)) !== foldPath(resolvePath(frameworkRoot))) {
     throw new Error(
       `CTX_PROJECT_ROOT '${projectRoot}' must equal CTX_FRAMEWORK_ROOT '${frameworkRoot}'. ` +
       `A divergence indicates a sandbox/live environment leak — likely one of the two was ` +
