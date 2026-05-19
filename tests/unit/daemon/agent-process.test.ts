@@ -187,7 +187,7 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // marker moments ago. handleExit should recognize the shutdown-in-progress
     // signal and bail out before touching the crash counter or restarts.log.
     fsMocks.existsSync.mockImplementation((p: any) => {
-      const path = String(p);
+      const path = String(p).replace(/\\/g, '/');
       return path.endsWith('/state/alice/.daemon-stop');
     });
     fsMocks.statSync.mockImplementation((p: any) => ({ mtimeMs: Date.now() - 2_000 }));
