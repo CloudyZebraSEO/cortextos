@@ -125,6 +125,27 @@ export const addAgentCommand = new Command('add-agent')
       } catch (err) {
         console.error(`Warning: failed to install codex skill symlinks: ${(err as Error).message}`);
       }
+
+      // The agent-codex template ships coder-agent tools under tools/ (codex-exec.sh,
+      // worktree-guard.sh, three-brain-file.sh). copyTemplateFiles writes them via
+      // writeFileSync, which drops the exec bit — restore it so the agent can run them.
+      try {
+        const toolsDir = join(agentDir, 'tools');
+        if (existsSync(toolsDir)) {
+          let chmodCount = 0;
+          for (const f of readdirSync(toolsDir)) {
+            if (f.endsWith('.sh')) {
+              chmodSync(join(toolsDir, f), 0o755);
+              chmodCount++;
+            }
+          }
+          if (chmodCount > 0) {
+            console.log(`  Made ${chmodCount} coder-agent tool script(s) executable`);
+          }
+        }
+      } catch (err) {
+        console.error(`Warning: failed to set exec bit on tools/: ${(err as Error).message}`);
+      }
     }
 
     // Create goals.json (empty — orchestrator will populate on morning cascade)
@@ -239,6 +260,7 @@ export const addAgentCommand = new Command('add-agent')
             '',
             '- Agent-to-agent: `cortextos bus send-message <agent> <priority> "<text>"`',
             '- Telegram to user: `cortextos bus send-telegram <chat_id> "<text>"`',
+            '- React to a Telegram message (single emoji ack, no verbal noise): `cortextos bus react-telegram <chat_id> <message_id> 👍`',
             '- Check inbox: `cortextos bus check-inbox`',
             '',
           ].join('\n');
@@ -447,5 +469,6 @@ Complete tasks: \`cortextos bus complete-task <id> --result "<text>"\`
 Log events: \`cortextos bus log-event <category> <event> <severity>\`
 Update heartbeat: \`cortextos bus update-heartbeat "<status>"\`
 Send Telegram: \`cortextos bus send-telegram <chat_id> "<text>"\`
+React to Telegram message (single emoji ack): \`cortextos bus react-telegram <chat_id> <message_id> 👍\`
 `;
 }

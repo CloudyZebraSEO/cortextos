@@ -15,7 +15,8 @@
       "CronDelete",
       "Skill",
       "Agent"
-    ]
+    ],
+    "defaultMode": "bypassPermissions"
   },
   "statusLine": {
     "type": "command",

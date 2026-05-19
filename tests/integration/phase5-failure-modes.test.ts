@@ -237,7 +237,11 @@ describe('FM-1: Disk full — ENOSPC write failure, no data loss on recovery', (
     scheduler.stop();
   });
 
-  it('atomicWriteSync: ENOSPC on tmp write throws; subsequent write succeeds', () => {
+  // POSIX-only: chmod 0o555 on a directory does not actually deny writes on Windows.
+  // Windows uses ACLs, not Unix mode bits. The atomicWriteSync semantics covered here
+  // (propagate write errors, recover after permission restored) are equally true on
+  // Windows, but the directory-permission scaffold to *simulate* ENOSPC isn't.
+  it.skipIf(process.platform === 'win32')('atomicWriteSync: ENOSPC on tmp write throws; subsequent write succeeds', () => {
     // Direct unit test: atomicWriteSync propagates write errors correctly.
     // We simulate ENOSPC by writing to a path in a non-writable directory.
     const readOnlyDir = join(tmpRoot, 'readonly-dir');
