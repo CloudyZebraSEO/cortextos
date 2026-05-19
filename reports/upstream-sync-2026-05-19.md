@@ -17,7 +17,7 @@
   - Pre-merge baseline: **44 failed** (categorized in `workspace/triage-2026-05-13.md`)
   - Immediately post-merge: **70 failed** (env canary `fe39493` exposed 26 latent test-isolation issues — the right shape, not a regression)
   - After 12 cross-platform fix commits: **11 failed** (all in deferred buckets: fakeTimer race, perf budgets, simulation timing)
-- **No Mac/Linux regressions expected:** 11 of 12 commits are platform-neutral. The one platform-branched commit (`7bb1a8e` ENOSPC test skip on Windows) is gated behind `process.platform === 'win32'`.
+- **Cross-platform safety:** by inspection of every diff, 12 of 13 fix commits are platform-neutral; the one platform-branched commit (`7bb1a8e` ENOSPC test skip on Windows) is gated behind `process.platform === 'win32'`. **Mac/Linux CI has NOT been re-run** post-merge from this Windows shell — that's a known gap; verifying CI green on Mac/Linux is the merge-time first action. No diff in the 13 commits touches platform-conditional logic without the explicit `process.platform` gate.
 - **Codex CLI adversarial review** during Phase 1 caught 6 factual errors and 3 UNVERIFIED claims in my v1 merge plan. Self-review discipline reaffirmed.
 
 ---
@@ -99,9 +99,12 @@
 
 ---
 
-## Appendix — Phase 2 commits (all on `sync/upstream-2026-05-19`)
+## Appendix — branch composition on `sync/upstream-2026-05-19`
+
+### Fix commits (the merge-fix work, the audited set)
 
 ```
+c048f4e test(review): adversarial-review polish — anchored prefix, named assertions, header sync
 92fb346 test(add-agent-codex): bump expected skill count to 24 (mirrors three-brain)
 7bb1a8e test(phase5-failure-modes): skip POSIX-only ENOSPC scenario on Windows  [WIN-GATED]
 e3dc4ce test(agent-process): normalize fs mock path for .daemon-stop existsSync (Windows)
@@ -113,11 +116,19 @@ a64bfc8 test(knowledge-base): normalize fs mock path before suffix check (Window
 d298a50 test(paths): make assertions path-separator-agnostic for Windows
 332ca07 test(crlf): tolerate Windows CRLF line endings in YAML frontmatter regex
 9e73aa4 test(env): scrub inherited CTX_AGENT_DIR / CTX_PROJECT_ROOT in vitest setup
-f0e466c chore(agent-codex): in-flight template tools + chmod loop (pre-merge WIP)
-62bddb4 Merge remote-tracking branch 'upstream/main' into sync/upstream-2026-05-19
 ```
 
-11 of 12 platform-neutral; one Windows-gated (ENOSPC test scaffold).
+**13 fix commits total.** 12 platform-neutral; one Windows-gated (ENOSPC test scaffold).
+
+### Pre-existing commits also on this branch (NOT part of the audited fix work)
+
+```
+42b2ac6 docs(reports): upstream sync 2026-05-19 — 14 commits, 70→11 Windows fails  ← this report
+f0e466c chore(agent-codex): in-flight template tools + chmod loop (pre-merge WIP)
+62bddb4 Merge remote-tracking branch 'upstream/main' into sync/upstream-2026-05-19  ← the upstream merge itself
+```
+
+The WIP commit (`f0e466c`) preserves the codex-template work that was on the misnamed `fix/codex-windows-compat` branch before the §7 branch surgery. The merge commit (`62bddb4`) is the 14-upstream-commit pull.
 
 ---
 
