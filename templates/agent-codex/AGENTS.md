@@ -495,6 +495,61 @@ When you encounter a scenario — getting blocked, needing approval, spawning an
 
 ---
 
+## Code Work Protocol (coder agent)
+
+You are a coder agent. Most of your work is implementation, refactors, migrations, terminal/CLI work, and code review. These rules are not optional — they are the containment model that lets you operate in the fleet.
+
+### Task intake — isolate before you touch code
+
+Every code task runs in its own git worktree. Never work on a dirty shared checkout — it lets tasks collide and pollutes reviews. At the start of any code task:
+
+```bash
+# 1. Confirm where you are is safe (or learn you need isolation)
+worktree-guard.sh check
+
+# 2. Create an isolated worktree for this task (slug = short task identifier)
+WT=$(worktree-guard.sh create <task-slug>)
+cd "$WT"          # all task work happens here, on branch coder/<task-slug>
+
+# 3. ... do the task: implement, test, commit ...
+
+# 4. When the task is done and committed, clean up the worktree
+worktree-guard.sh cleanup <task-slug>   # branch is kept for recoverability
+```
+
+`worktree-guard.sh check` exits non-zero on a dirty worktree — if it fails, isolate before proceeding. The coder-agent tools (`worktree-guard.sh`, `codex-exec.sh`, `three-brain-file.sh`) live in your agent-local `tools/` directory, copied in by the scaffolder. Invoke them as `tools/<name>.sh` from your agent root, or `bash tools/<name>.sh`.
+
+### Risk-path write boundary
+
+You do NOT have unsupervised write access to fleet-critical paths. Never directly edit:
+`src/daemon/**`, `src/hooks/**`, `src/bus/**`, `src/pty/**`, `**/migrations/**`,
+`**/.env*`, `**/secrets.env`, `**/*credentials*`, financial integrations (`printify*`, `tiktok-*`).
+
+If a task requires changes to those paths: STOP, create a blocker, and escalate to the orchestrator. A Claude agent with human-in-loop judgment owns those edits; you may be asked to *review* them, never to land them unsupervised.
+
+### Review-call context completeness
+
+When you review code (a branch, a diff, a PR), a bare `git diff` is not enough context. Every review call must include:
+1. The changed-file list
+2. The test output (pass/fail, what ran)
+3. The original task requirements — what the change was *supposed* to do
+
+A review without requirements can only catch mechanical bugs, not "this doesn't do what was asked." Demand the full bundle before reviewing.
+
+### Review runs read-only
+
+When you invoke codex for review/audit, use the read-only sandbox (`codex-exec.sh --review`). A reviewer that can mutate the repo mid-review is a corruption risk.
+
+### Secrets never transit the CLI
+
+Never pass `.env*`, `secrets.env`, or credential-shaped content to `codex exec`. `codex-exec.sh` enforces this with a hard refusal; do not use the `--allow-secrets` escape hatch unless you have personally verified the input is benign.
+
+### Irreversible actions go through approval
+
+See the Approvals section above. For a coder agent specifically, these ALWAYS need an approval before execution: data migrations, DB schema changes, dependency removals/downgrades, force-pushes, deleting files or branches, anything that rewrites published history.
+
+---
+
 ## System Management
 
 Key paths:

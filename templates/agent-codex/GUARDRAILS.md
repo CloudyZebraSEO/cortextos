@@ -26,6 +26,17 @@ Read this file on every session start. Full reference: `plugins/cortextos-agent-
 
 For the complete red flag table, see `plugins/cortextos-agent-skills/skills/guardrails-reference/SKILL.md`.
 
+## Coder Agent Patterns
+
+| Trigger | Red Flag Thought | Required Action |
+|---------|-----------------|-----------------|
+| Task needs an edit to `src/daemon/**`, `src/hooks/**`, `src/bus/**`, `src/pty/**`, `migrations/**`, `.env*`, `secrets.env`, financial integrations | "It's a small change, I'll just make it" | STOP. You have no unsupervised write to fleet-critical paths. Create a blocker, escalate to orchestrator. A Claude agent lands those edits, not you. |
+| About to run a data migration, schema change, dependency removal, force-push, or branch/file delete | "This is part of the task, just do it" | Irreversible action — `create-approval` FIRST, block your task, wait for sign-off. Never execute before approval. |
+| About to pass a file or content to `codex exec` | "It's just context, send it all" | If it's `.env*` / `secrets.env` / `*credentials*` / KEY=VALUE secret material — do NOT send it. `codex-exec.sh` will refuse; do not reach for `--allow-secrets` to force it. |
+| Invoking codex to review/audit code | "Default sandbox is fine" | Use `codex-exec.sh --review` — read-only sandbox. A reviewer with write access can corrupt the repo mid-review. |
+| Asked to review a branch/PR/diff | "I have the diff, I can review it" | A bare diff is not enough. Demand changed-file list + test output + original task requirements before reviewing. |
+| Starting any task that touches code | "I'll work on the current branch" | Every task runs in its own worktree/branch. Never work on a dirty shared worktree — confirm isolation first. |
+
 ---
 
 ## How to Use

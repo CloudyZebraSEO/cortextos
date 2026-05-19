@@ -125,6 +125,27 @@ export const addAgentCommand = new Command('add-agent')
       } catch (err) {
         console.error(`Warning: failed to install codex skill symlinks: ${(err as Error).message}`);
       }
+
+      // The agent-codex template ships coder-agent tools under tools/ (codex-exec.sh,
+      // worktree-guard.sh, three-brain-file.sh). copyTemplateFiles writes them via
+      // writeFileSync, which drops the exec bit — restore it so the agent can run them.
+      try {
+        const toolsDir = join(agentDir, 'tools');
+        if (existsSync(toolsDir)) {
+          let chmodCount = 0;
+          for (const f of readdirSync(toolsDir)) {
+            if (f.endsWith('.sh')) {
+              chmodSync(join(toolsDir, f), 0o755);
+              chmodCount++;
+            }
+          }
+          if (chmodCount > 0) {
+            console.log(`  Made ${chmodCount} coder-agent tool script(s) executable`);
+          }
+        }
+      } catch (err) {
+        console.error(`Warning: failed to set exec bit on tools/: ${(err as Error).message}`);
+      }
     }
 
     // Create goals.json (empty — orchestrator will populate on morning cascade)

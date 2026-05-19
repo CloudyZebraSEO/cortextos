@@ -167,7 +167,7 @@ export const dashboardCommand = new Command('dashboard')
     // Pass as single string to avoid Node.js DEP0190 deprecation warning.
     const child = IS_WINDOWS
       ? spawn(['npx', ...startArgs].join(' '), { cwd: dashboardDir, stdio: ['ignore', logFd, logFd], env: dashEnv, shell: true, detached: true, windowsHide: true })
-      : spawn('npx', startArgs, { cwd: dashboardDir, stdio: ['ignore', logFd, logFd], env: dashEnv, detached: true });
+      : spawn('npx', startArgs, { cwd: dashboardDir, stdio: ['ignore', logFd, logFd], env: dashEnv, detached: true, windowsHide: true });
 
     // Detach the child from our event loop so parent exit does not take
     // it down. SIGHUP at the parent (tty close) then just terminates the
