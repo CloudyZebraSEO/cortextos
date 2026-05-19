@@ -81,7 +81,8 @@ export type EventCategory =
   | 'message'
   | 'task'
   | 'approval'
-  | 'agent_activity';
+  | 'agent_activity'
+  | 'security';
 
 export type EventSeverity = 'info' | 'warning' | 'error' | 'critical';
 
