@@ -96,7 +96,9 @@ afterEach(() => {
  */
 function mockMissingKbConfig(): void {
   fsMocks.existsSync.mockImplementation((p: any) => {
-    const path = String(p);
+    // Normalize backslashes to forward-slash so the suffix check works on
+    // Windows, where node path-resolution returns 'C:\...\knowledge-base\config.json'.
+    const path = String(p).replace(/\\/g, '/');
     if (path.endsWith('/knowledge-base/config.json')) return false;
     return true;
   });
