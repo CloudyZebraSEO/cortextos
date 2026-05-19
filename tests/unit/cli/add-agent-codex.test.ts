@@ -10,8 +10,9 @@
  *
  * The fix routes `--runtime codex-app-server` (with the default --template
  * agent) at templates/agent-codex/, which: (a) documents the bus reply rule
- * prominently in AGENTS.md and TOOLS.md, (b) ships the 23 codex-compatible
- * skills under plugins/cortextos-agent-skills/skills/, and (c) sets runtime
+ * prominently in AGENTS.md and TOOLS.md, (b) ships the 24 codex-compatible
+ * skills under plugins/cortextos-agent-skills/skills/ (23 baseline + three-brain
+ * mirror added 2026-05-19 per fd6637f parity), and (c) sets runtime
  * + model defaults in config.json.
  *
  * The scaffolder also walks the skills tree post-copy and creates one
@@ -137,6 +138,10 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     // Spot check: comms is the skill that teaches the Telegram reply pattern.
     expect(skills).toContain('comms');
     expect(skills).toContain('onboarding');
+    // three-brain landed via fd6637f (mirrored into codex template 2026-05-19).
+    // Pin it explicitly so a future regression that drops the file is caught
+    // by name, not just by count.
+    expect(skills).toContain('three-brain');
   });
 
   it('creates ~/.codex/skills/<agent>__<skill> symlinks for every skill', async () => {
@@ -152,6 +157,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(existsSync(codexSkillsDir)).toBe(true);
     const links = readdirSync(codexSkillsDir).filter(n => n.startsWith('codex-links__'));
     expect(links.length).toBe(24);
+    expect(links).toContain('codex-links__three-brain');
 
     // Each entry must be a symlink (not a copy), pointing at the agent's local skill dir.
     for (const link of links) {
