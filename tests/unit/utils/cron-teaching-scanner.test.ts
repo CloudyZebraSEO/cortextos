@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { join, sep } from 'path';
 import { tmpdir } from 'os';
 import {
   scanFile,
@@ -144,9 +144,13 @@ describe('listAgentFiles', () => {
     write('.claude/skills/agent-management/SKILL.md', 'am\n');
     write('.claude/skills/agent-management/notes.md', 'ignored\n'); // not SKILL.md
     const files = listAgentFiles(workDir);
-    const basenames = files.map((f) =>
-      f.replace(workDir + require('path').sep, '').replace(/\\/g, '/'),
-    );
+    // Anchor the strip to the workDir prefix so a stray match later in the
+    // path can't accidentally normalize a malformed path into a false pass.
+    const basenames = files.map((f) => {
+      const prefix = workDir + sep;
+      const rel = f.startsWith(prefix) ? f.slice(prefix.length) : f;
+      return rel.replace(/\\/g, '/');
+    });
     expect(basenames).toContain('.claude/skills/cron-management/SKILL.md');
     expect(basenames).toContain('.claude/skills/agent-management/SKILL.md');
     expect(basenames).not.toContain('.claude/skills/agent-management/notes.md');

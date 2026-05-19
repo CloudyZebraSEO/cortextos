@@ -218,7 +218,7 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // we do NOT want it to silently swallow genuine crashes hours later.
     // The 60s window in isDaemonShuttingDown() is the load-bearing check.
     fsMocks.existsSync.mockImplementation((p: any) =>
-      String(p).endsWith('/state/alice/.daemon-stop'),
+      String(p).replace(/\\/g, '/').endsWith('/state/alice/.daemon-stop'),
     );
     fsMocks.statSync.mockImplementation((p: any) => ({ mtimeMs: Date.now() - 3_600_000 })); // 1h old
 
