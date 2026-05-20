@@ -320,7 +320,10 @@ export function checkUpstream(
   frameworkRoot: string,
   options: { apply?: boolean } = {},
 ): UpstreamResult {
-  const execOpts = { cwd: frameworkRoot, encoding: 'utf-8' as const, timeout: 30000 };
+  // windowsHide: checkUpstream runs on a daily background cron (and via `cortextos
+  // update`). Each git subprocess would otherwise flash a console window on Windows.
+  // Shared across every git call below via spread. Does not suppress piped output.
+  const execOpts = { cwd: frameworkRoot, encoding: 'utf-8' as const, timeout: 30000, windowsHide: true };
 
   // Check if it's a git repo
   try {

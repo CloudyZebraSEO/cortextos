@@ -1264,6 +1264,7 @@ busCommand
       execFileSync(pythonPath, [mmragPath, 'collections'], {
         stdio: 'inherit',
         env: envVars,
+        windowsHide: true,
       });
     } catch {
       // python printed error already
@@ -1278,7 +1279,11 @@ busCommand
 
 function runHook(hookName: string): void {
   const hookPath = join(__dirname, `hooks/${hookName}.js`);
-  const result = spawnSync(process.execPath, [hookPath], { stdio: 'inherit' });
+  // windowsHide: this fan-out fires on every `cortextos bus` hook invocation —
+  // the highest-frequency runtime spawn. Without it Windows flashes a console
+  // window per call (regression that caused the 2026-05-20 conhost storm).
+  // stdio:'inherit' is preserved — windowsHide hides the console window, not the streams.
+  const result = spawnSync(process.execPath, [hookPath], { stdio: 'inherit', windowsHide: true });
   process.exit(result.status ?? 0);
 }
 
@@ -2616,6 +2621,7 @@ busCommand
           const result = execFileSync('tmux', ['capture-pane', '-t', sessionName, '-p'], {
             encoding: 'utf-8',
             stdio: ['ignore', 'pipe', 'ignore'],
+            windowsHide: true, // tui-stream poll loop — hide per-iteration spawn (harmless on non-Windows where tmux lives)
           });
           currentOutput = result;
         } catch {
