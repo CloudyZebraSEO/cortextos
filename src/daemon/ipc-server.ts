@@ -474,10 +474,29 @@ export function handleRemoveCron(
  * Uses Unix domain socket on macOS/Linux, named pipe on Windows.
  * Replaces SIGUSR1 and other signal-based IPC.
  */
+/**
+ * Idle timeout (ms) for an inbound IPC connection. A well-behaved client
+ * connects, sends one JSON request, gets a response, and the socket closes.
+ * A client that connects but never sends a complete JSON message would
+ * otherwise keep its socket (and its growing `data` buffer) alive forever.
+ * Over a 71h daemon lifetime these abandoned half-open sockets accumulate
+ * into the handle/heap leak oracle observed (diag-daemon-oom-2026-05-21).
+ * 30s is far longer than any real request needs.
+ */
+const IPC_CONN_IDLE_MS = 30_000;
+
 export class IPCServer {
   private server: Server | null = null;
   private socketPath: string;
   private agentManager: AgentManager;
+  /**
+   * Live inbound connections. Tracked so stop() can destroy every open
+   * socket — otherwise lingering sockets keep the server (and its listeners)
+   * referenced after close, leaking across daemon restart attempts.
+   */
+  private connections = new Set<Socket>();
+  /** Guards the EADDRINUSE recovery so it retries listen() at most once. */
+  private eaddrinuseRetried = false;
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
@@ -497,8 +516,19 @@ export class IPCServer {
       }
     }
 
+    this.eaddrinuseRetried = false;
+
     return new Promise((resolve, reject) => {
       this.server = createServer((socket: Socket) => {
+        // Track the connection so stop() can tear it down, and untrack it
+        // whenever it closes (normal end, error, or idle-timeout destroy).
+        this.connections.add(socket);
+        socket.once('close', () => this.connections.delete(socket));
+
+        // Destroy abandoned/half-open connections that never deliver a
+        // complete request — otherwise their socket + data buffer leak.
+        socket.setTimeout(IPC_CONN_IDLE_MS, () => socket.destroy());
+
         let data = '';
         socket.on('data', (chunk) => {
           data += chunk.toString();
@@ -513,14 +543,23 @@ export class IPCServer {
         });
 
         socket.on('error', () => {
-          // Client disconnected
+          // Client disconnected — 'close' fires next and untracks the socket.
         });
       });
 
+      // EADDRINUSE recovery. The previous implementation re-called listen()
+      // from inside this handler with no guard: if the socket stayed in use
+      // (e.g. an orphan daemon still holding the pipe — exactly the dup-poller
+      // scenario in diag-daemon-oom-2026-05-21), each failed retry re-emitted
+      // 'error', which called listen() again, spinning a tight infinite retry
+      // loop that leaked listeners/handles and burned heap. Now we retry the
+      // stale-socket cleanup at most once, then reject so the daemon surfaces
+      // the real failure instead of looping.
       this.server.on('error', (err: NodeJS.ErrnoException) => {
-        if (err.code === 'EADDRINUSE') {
+        if (err.code === 'EADDRINUSE' && !this.eaddrinuseRetried) {
+          this.eaddrinuseRetried = true;
           // Race: process was killed after unlink but before bind completed.
-          // Clean up the re-created socket and retry once.
+          // Clean up the re-created socket and retry listen exactly once.
           try { unlinkSync(this.socketPath); } catch { /* ignore */ }
           this.server!.listen(this.socketPath, () => {
             console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
@@ -549,7 +588,21 @@ export class IPCServer {
    * Stop the IPC server.
    */
   stop(): void {
+    // Destroy any still-open connections first. server.close() only stops
+    // accepting new connections — it does NOT close live sockets, and a
+    // lingering socket keeps the server (and its listeners) referenced,
+    // which is part of the leak across restart attempts.
+    for (const socket of this.connections) {
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+    this.connections.clear();
+
     if (this.server) {
+      // Strip listeners so the Server object can be GC'd cleanly and so a
+      // re-created server in a later start() never inherits stale handlers
+      // (the source of the "MaxListenersExceededWarning: 11 listeners" the
+      // daemon logged before this fix).
+      this.server.removeAllListeners();
       this.server.close();
       this.server = null;
     }
