@@ -283,21 +283,20 @@ This is the knowledge you have synthesised over time. Not a log — a living doc
 
 Also update GUARDRAILS.md when you identify a pattern of behaviour that should be explicitly prohibited or corrected — not just for yourself but as a guardrail for future sessions.
 
-Update on every heartbeat and at session end. When you update MEMORY.md, ingest it to your `memory-{agent}` KB collection so it is semantically searchable.
+Update on every heartbeat and at session end. When you update MEMORY.md, ingest it to your private KB collection (`agent-{agent}`) so it is semantically searchable.
 
 ### Layer 3: Knowledge Base — Associative Memory (RAG/ChromaDB)
 
 The knowledge base is a semantic vector store (ChromaDB, Gemini Embedding 2). Think of it as your associative memory — not held in your head, but instantly searchable by meaning. It works like your own memory system: Gemini describes every non-text file (image, video, audio, PDF, Office doc) and embeds the description together with the content so you can find things by what they mean, not just what they literally say. Queries return the matching content plus full metadata: source path, similarity score, file type, chunk position, page number, timestamps.
 
-**Three collections — different management models:**
+**Two collections:**
 
 | Collection | Scope | What goes in | How managed |
 |---|---|---|---|
-| `memory-{agent}` | Private | MEMORY.md + daily memory files | **Auto** — re-indexed on every heartbeat |
-| `private-{agent}` | Private | Your outputs, research docs, workspace files | **Agent-managed** — ingest when you produce something worth keeping |
-| `shared-{org}` | Org-wide | Research findings, reports, org knowledge | **Agent-managed** — ingest when the whole org benefits |
+| `agent-{agent}` | Private (`--scope private`) | Your MEMORY.md + daily memory files, plus your outputs, research docs, and workspace files | Heartbeat auto-re-ingests your memory files; you ingest outputs as you produce them |
+| `shared-{org}` | Org-wide (`--scope shared`) | Research findings, reports, org knowledge | **Agent-managed** — ingest when the whole org benefits |
 
-**memory-{agent} is automatic.** On every heartbeat cycle, re-ingest your memory files so they stay current and searchable:
+**Your private collection (`agent-{agent}`) — keep it current.** On every heartbeat cycle, re-ingest your memory files so they stay searchable:
 ```bash
 # Run on every heartbeat
 cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
@@ -309,13 +308,13 @@ cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
 - When the user asks a factual question about the org, projects, or people
 - When you encounter an error — has this happened before?
 - When referencing named entities (clients, projects, systems)
-- To recall your own past work: query `memory-{agent}` or `private-{agent}` specifically
+- To recall your own past work: query your private collection specifically (`--scope private`)
 
-**When to ingest private-{agent} and shared-{org} — your judgment:**
-- After completing a task with a notable output → `private-{agent}`
-- After completing research → `shared-{org}` (the whole org benefits)
+**When to ingest (private vs shared) — your judgment:**
+- After completing a task with a notable output → private (`--scope private`)
+- After completing research → shared (`--scope shared`, the whole org benefits)
 - After producing a document, report, or significant file → appropriate scope
-- After the user shares a file with you → `private-{agent}`
+- After the user shares a file with you → private (`--scope private`)
 - After a workflow completes → ingest the artifacts
 
 ```bash
