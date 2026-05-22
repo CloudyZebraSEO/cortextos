@@ -115,12 +115,15 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     // up and reject rather than re-listen forever. Guard with a timeout so a
     // regression (infinite loop / hang) fails the test instead of stalling it.
     const second = makeServer(instanceId);
+    // Assert the SPECIFIC rejection (live-owner refusal), not just any
+    // rejection — otherwise a regression that hangs would be "caught" by the
+    // timeout below and falsely pass. The timeout only guards against a stall.
     await expect(
       Promise.race([
         second.start(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('start() hung — EADDRINUSE retry loop?')), 3000)),
       ]),
-    ).rejects.toBeTruthy();
+    ).rejects.toThrow(/in use by a live process|owned by a live process/);
 
     // The probe-before-unlink guard must NOT have stolen the live first
     // server's path: a fresh client must still be able to connect to it.
@@ -231,6 +234,28 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     expect(String((rejected[0] as PromiseRejectedResult).reason)).toMatch(/in progress/i);
 
     await server.stop();
+  });
+
+  it('stop -> start -> stop resolves with the server actually down', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+    await server.start();
+
+    // Queue stop, then start, then stop — without awaiting in between. The
+    // final stop must NOT short-circuit on the first stop's promise (which
+    // resolves before the queued start binds); it must chain a teardown after
+    // the start so the authoritative end state is DOWN.
+    const s1 = server.stop();
+    const st = server.start();
+    const s2 = server.stop();
+    await Promise.allSettled([s1, st]);
+    await s2;
+
+    // Path must be free: a brand-new server binds immediately. If the queued
+    // start had been left running, this would fail with a live-owner refusal.
+    const reuse = makeServer(instanceId);
+    await expect(reuse.start()).resolves.toBeUndefined();
+    await reuse.stop();
   });
 
   it('stop() during an in-flight start() does not orphan a listening server', async () => {

@@ -536,11 +536,14 @@ export class IPCServer {
     if (this.startPromise) {
       throw new Error('IPCServer.start() called while a start is already in progress');
     }
-    this.startPromise = this._doStart();
+    const sp = this._doStart();
+    this.startPromise = sp;
     try {
-      await this.startPromise;
+      await sp;
     } finally {
-      this.startPromise = null;
+      // Identity-guarded reset (symmetry with stop()): only clear if still the
+      // current handle.
+      if (this.startPromise === sp) this.startPromise = null;
     }
   }
 
@@ -611,6 +614,11 @@ export class IPCServer {
           try {
             const request: IPCRequest = JSON.parse(data);
             data = '';
+            // Clear the idle timeout now that a full request is in hand: the
+            // timer measures inactivity, and a handleRequest that takes >30s
+            // to produce its response would otherwise have its socket
+            // destroyed mid-flight.
+            socket.setTimeout(0);
             this.handleRequest(request, socket);
           } catch {
             // Incomplete JSON, wait for more data
@@ -622,9 +630,17 @@ export class IPCServer {
         });
       });
 
-      // Tear down a server that failed to come up and reject, leaving the
-      // instance reusable (this.server stays null, so start() can be retried).
+      // Tear down a server that failed and reject. For a pre-listen failure
+      // this.server is still null, so the instance stays reusable. For a rare
+      // post-listen 'error' (e.g. an OS-level socket abort after onListening
+      // committed this.server), also clear the committed state so the instance
+      // doesn't become a zombie — truthy this.server pointing at a dead server.
+      // The reject() is a no-op once the start promise has already resolved.
       const failStart = (err: Error): void => {
+        if (this.server === server) {
+          this.server = null;
+          this.ownsSocketPath = false;
+        }
         try { server.removeAllListeners(); } catch { /* ignore */ }
         try { server.close(); } catch { /* ignore */ }
         reject(err);
@@ -735,27 +751,35 @@ export class IPCServer {
    * process.on('exit') fire-and-forget path still releases everything.
    */
   stop(): Promise<void> {
-    // A stop already in flight: return the same promise so a second stop()
-    // never double-runs teardown before the first close() callback has fired.
-    if (this.stopPromise) return this.stopPromise;
-
+    // Check for an in-flight start FIRST. The authoritative "stopped" state is
+    // only reached after that start settles AND we tear down, so we must chain
+    // a fresh teardown after it — even if an earlier stopPromise already
+    // exists. Returning that earlier promise here would resolve before the
+    // queued start runs and leave the server listening (stop->start->stop
+    // race). Its deferred onListening() could otherwise commit this.server
+    // after we "stopped". (Unreachable on the synchronous process.on('exit')
+    // path: the daemon's boot start() resolved long before shutdown, so the
+    // synchronous teardown in _doStop() below still applies there.)
     if (this.startPromise) {
-      // A start is still in flight. Wait it out before tearing down — its
-      // deferred onListening() could otherwise commit this.server AFTER we
-      // stopped, leaving an orphaned listening server. (Unreachable on the
-      // synchronous process.on('exit') path: the daemon's boot start()
-      // resolved long before shutdown, so there is no in-flight start there
-      // and the synchronous teardown in _doStop() still applies.)
-      this.stopPromise = this.startPromise
+      const start = this.startPromise;
+      const p = start
         .catch(() => { /* start failed — it committed nothing to tear down */ })
         .then(() => this._doStop());
-    } else {
-      this.stopPromise = this._doStop();
+      this.stopPromise = p;
+      // Identity-guarded reset: only clear if still the current handle, so a
+      // newer stopPromise isn't nulled out from under a live teardown.
+      void p.finally(() => { if (this.stopPromise === p) this.stopPromise = null; });
+      return p;
     }
-    // Clear the handle once teardown settles so a later start->stop cycle is
-    // not wedged on a stale promise.
-    void this.stopPromise.finally(() => { this.stopPromise = null; });
-    return this.stopPromise;
+
+    // No start in flight: dedup concurrent stop() calls on one teardown so a
+    // second stop() never double-runs it before the first close() fires.
+    if (this.stopPromise) return this.stopPromise;
+
+    const p = this._doStop();
+    this.stopPromise = p;
+    void p.finally(() => { if (this.stopPromise === p) this.stopPromise = null; });
+    return p;
   }
 
   /**
