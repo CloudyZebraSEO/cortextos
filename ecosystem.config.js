@@ -18,6 +18,18 @@ module.exports = {
         CTX_PROJECT_ROOT: "C:\\Users\\steve\\cortextos",
         CTX_ORG: process.env.CTX_ORG || "aunnix",
       },
+      // OOM-cascade stabilizer (oracle diag 2026-05-21): the daemon leaks V8
+      // heap until it hits the ~4GB fatal limit, OOM-crashes, and takes the
+      // whole agent fleet down with it (every PTY child fast-fails 0xC0000409
+      // in the same second). max_memory_restart recycles the daemon gracefully
+      // at 1.5GB — well before the fatal wall — so a recycle is a clean blip
+      // instead of a fleet-wide cascade. This is the ops stabilizer; the heap
+      // leak root-causes (IPC listener leak, orphan subprocess pileup, dup
+      // poller) are fixed separately in this same branch.
+      max_memory_restart: '1500M',
+      // Suppress the transient console window PM2 would otherwise flash when
+      // (re)spawning the daemon on Windows. Matches the dashboard block.
+      windowsHide: true,
       max_restarts: 50,
       restart_delay: 5000,
       autorestart: true,
@@ -25,13 +37,14 @@ module.exports = {
     {
       name: 'cortextos-dashboard',
       script: "C:\\Users\\steve\\cortextos\\dashboard\\node_modules\\next\\dist\\bin\\next",
-      args: 'dev',
+      args: "dev",
       cwd: "C:\\Users\\steve\\cortextos\\dashboard",
       env: {
         PORT: process.env.PORT || '3000',
       },
       // Dashboard reads its real config from dashboard/.env.local — populated
-      // by /onboarding Phase 7. PM2 just supervises the npm process.
+      // by /onboarding Phase 7. PM2 just supervises the dashboard process.
+      windowsHide: true,
       max_restarts: 50,
       restart_delay: 5000,
       autorestart: true,
