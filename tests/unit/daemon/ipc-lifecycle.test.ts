@@ -33,12 +33,12 @@ const stubAgentManager = {} as AgentManager;
 let servers: IPCServer[] = [];
 let sockets: Socket[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const s of sockets) {
     try { s.destroy(); } catch { /* ignore */ }
   }
   for (const srv of servers) {
-    try { srv.stop(); } catch { /* ignore */ }
+    try { await srv.stop(); } catch { /* ignore */ }
   }
   servers = [];
   sockets = [];
@@ -68,7 +68,9 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     // Note: the 'close' event passes a `hadError` boolean to its listener, so
     // wrap resolve() to discard it and keep the promise resolving to undefined.
     const closed = new Promise<void>((resolve) => client.once('close', () => resolve()));
-    server.stop();
+    // stop() destroys live sockets synchronously before its first await, so
+    // the client 'close' fires regardless of when the returned promise settles.
+    void server.stop();
     await expect(
       Promise.race([
         closed,
@@ -92,6 +94,20 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
         new Promise((_, reject) => setTimeout(() => reject(new Error('start() hung — EADDRINUSE retry loop?')), 3000)),
       ]),
     ).rejects.toBeTruthy();
+
+    // The probe-before-unlink guard must NOT have stolen the live first
+    // server's path: a fresh client must still be able to connect to it.
+    // (Before the guard, the EADDRINUSE handler unlinked the path blindly,
+    // stranding the live server = split-brain.)
+    const client = createConnection(getIpcPath(instanceId));
+    sockets.push(client);
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        client.once('connect', () => resolve());
+        client.once('error', reject);
+        setTimeout(() => reject(new Error('live server unreachable — path was stolen')), 2000);
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it('supports start() -> stop() -> start() (reusable after listener cleanup)', async () => {
@@ -99,10 +115,11 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     const server = makeServer(instanceId);
 
     await server.start();
-    server.stop();
-    // Second start on the same instance must succeed: removeAllListeners() in
-    // stop() should leave no stranded handlers and the path should be free.
+    // Await stop() fully: server.close() is async, so a re-start before close
+    // completes could hit a transient EADDRINUSE. Awaiting proves the path is
+    // genuinely free and removeAllListeners() left no stranded handlers.
+    await server.stop();
     await expect(server.start()).resolves.toBeUndefined();
-    server.stop();
+    await server.stop();
   });
 });

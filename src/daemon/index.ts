@@ -279,7 +279,7 @@ class Daemon {
         console.error('[daemon] Error during shutdown:', err);
       }
       if (this.ipcServer) {
-        this.ipcServer.stop();
+        await this.ipcServer.stop();
       }
       // Clean up PID file
       try {

@@ -149,6 +149,9 @@ module.exports = {
       // leak root-causes (IPC listener leak, orphan subprocess pileup, dup
       // poller) are fixed separately in this same branch.
       max_memory_restart: '1500M',
+      // Suppress the transient console window PM2 would otherwise flash when
+      // (re)spawning the daemon on Windows. Matches the dashboard block.
+      windowsHide: true,
       max_restarts: 50,
       restart_delay: 5000,
       autorestart: true,

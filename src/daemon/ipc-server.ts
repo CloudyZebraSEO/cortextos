@@ -1,4 +1,4 @@
-import { createServer, Server, Socket } from 'net';
+import { createServer, createConnection, Server, Socket } from 'net';
 import { existsSync, unlinkSync, chmodSync, readFileSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
 import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '../types/index.js';
@@ -558,12 +558,32 @@ export class IPCServer {
       this.server.on('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE' && !this.eaddrinuseRetried) {
           this.eaddrinuseRetried = true;
-          // Race: process was killed after unlink but before bind completed.
-          // Clean up the re-created socket and retry listen exactly once.
-          try { unlinkSync(this.socketPath); } catch { /* ignore */ }
-          this.server!.listen(this.socketPath, () => {
-            console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
-            resolve();
+          // Probe before unlinking. A generic EADDRINUSE does NOT prove the
+          // socket is stale: a LIVE predecessor daemon could still be holding
+          // the path (the dup-poller scenario in diag-daemon-oom-2026-05-21).
+          // Blindly unlinking would strand that live server's socket and let
+          // us bind the same path = split-brain / two daemons. So we connect
+          // first: if something answers, refuse and surface the real failure;
+          // only when the probe is refused (nothing listening) do we treat the
+          // path as a stale leftover, unlink it, and retry listen exactly once.
+          const probe = createConnection(this.socketPath);
+          probe.once('connect', () => {
+            probe.destroy();
+            reject(new Error(
+              `IPC path ${this.socketPath} is in use by a live process; refusing to unlink it ` +
+              `(another daemon may already be running).`,
+            ));
+          });
+          probe.once('error', () => {
+            probe.destroy();
+            // Nothing is listening — stale socket file from a crashed
+            // predecessor (or a process killed after unlink but before bind).
+            // Safe to remove and retry listen exactly once.
+            try { unlinkSync(this.socketPath); } catch { /* ignore */ }
+            this.server!.listen(this.socketPath, () => {
+              console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
+              resolve();
+            });
           });
         } else {
           reject(err);
@@ -586,8 +606,18 @@ export class IPCServer {
 
   /**
    * Stop the IPC server.
+   *
+   * Resolves once the underlying server has fully closed. The critical
+   * teardown — destroying live sockets and calling server.close() — runs
+   * SYNCHRONOUSLY before the first await point, so a fire-and-forget caller
+   * inside a synchronous `process.on('exit')` handler still tears the server
+   * down correctly; only the close-completion await is skipped there.
+   *
+   * Listener removal and socket-file cleanup are deferred to the close
+   * callback: stripping listeners before close() would hide the close
+   * lifecycle and race the path cleanup against the actual close.
    */
-  stop(): void {
+  stop(): Promise<void> {
     // Destroy any still-open connections first. server.close() only stops
     // accepting new connections — it does NOT close live sockets, and a
     // lingering socket keeps the server (and its listeners) referenced,
@@ -597,17 +627,37 @@ export class IPCServer {
     }
     this.connections.clear();
 
-    if (this.server) {
-      // Strip listeners so the Server object can be GC'd cleanly and so a
-      // re-created server in a later start() never inherits stale handlers
-      // (the source of the "MaxListenersExceededWarning: 11 listeners" the
-      // daemon logged before this fix).
-      this.server.removeAllListeners();
-      this.server.close();
-      this.server = null;
+    const server = this.server;
+    this.server = null;
+
+    if (!server) {
+      this.cleanupSocketFile();
+      return Promise.resolve();
     }
 
-    // Clean up socket file
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        // Strip listeners only AFTER close completes so the Server object can
+        // be GC'd cleanly and a re-created server in a later start() never
+        // inherits stale handlers (the source of the "MaxListenersExceeded
+        // Warning: 11 listeners" the daemon logged before this fix).
+        server.removeAllListeners();
+        this.cleanupSocketFile();
+        resolve();
+      };
+      // close() stops accepting new connections and fires once all connections
+      // are closed — we destroyed them above, so this is prompt.
+      server.close(() => finish());
+      // Safety net: never hang a caller if close() somehow never calls back.
+      setTimeout(finish, 2000).unref();
+    });
+  }
+
+  /** Remove the Unix socket file (no-op on Windows named pipes). */
+  private cleanupSocketFile(): void {
     if (process.platform !== 'win32' && existsSync(this.socketPath)) {
       try {
         unlinkSync(this.socketPath);
