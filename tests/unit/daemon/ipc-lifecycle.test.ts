@@ -110,6 +110,31 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('stop() on a failed contender does not unlink the live owner\'s socket', async () => {
+    const instanceId = uniqueInstanceId();
+    const first = makeServer(instanceId);
+    await first.start();
+
+    // Contender loses the EADDRINUSE race and rejects (never owns the path).
+    const second = makeServer(instanceId);
+    await expect(second.start()).rejects.toBeTruthy();
+
+    // Stopping the failed contender must be a clean no-op for the socket file:
+    // it never owned the path, so it must NOT unlink the live owner's socket.
+    await second.stop();
+
+    // The live first server must still be reachable.
+    const client = createConnection(getIpcPath(instanceId));
+    sockets.push(client);
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        client.once('connect', () => resolve());
+        client.once('error', reject);
+        setTimeout(() => reject(new Error('live owner unreachable — contender stop() stole the path')), 2000);
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it('supports start() -> stop() -> start() (reusable after listener cleanup)', async () => {
     const instanceId = uniqueInstanceId();
     const server = makeServer(instanceId);

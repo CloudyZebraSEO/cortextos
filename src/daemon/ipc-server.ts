@@ -497,6 +497,14 @@ export class IPCServer {
   private connections = new Set<Socket>();
   /** Guards the EADDRINUSE recovery so it retries listen() at most once. */
   private eaddrinuseRetried = false;
+  /**
+   * True only once THIS instance has successfully bound the socket path.
+   * cleanupSocketFile() unlinks only when this is set — otherwise a contender
+   * instance that lost the EADDRINUSE race (and never owned the path) could
+   * unlink the LIVE owner's socket on its own stop(), stranding the real
+   * daemon. Reset on every start().
+   */
+  private ownsSocketPath = false;
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
@@ -517,6 +525,7 @@ export class IPCServer {
     }
 
     this.eaddrinuseRetried = false;
+    this.ownsSocketPath = false;
 
     return new Promise((resolve, reject) => {
       this.server = createServer((socket: Socket) => {
@@ -567,7 +576,18 @@ export class IPCServer {
           // only when the probe is refused (nothing listening) do we treat the
           // path as a stale leftover, unlink it, and retry listen exactly once.
           const probe = createConnection(this.socketPath);
+          // Bound the probe: if connect neither succeeds nor errors (platform
+          // edge case), don't hang start() forever — treat as inconclusive
+          // and reject rather than risk unlinking a possibly-live path.
+          const probeTimer = setTimeout(() => {
+            probe.destroy();
+            reject(new Error(
+              `IPC path ${this.socketPath} probe timed out; refusing to unlink (state unknown).`,
+            ));
+          }, 1_000);
+          probeTimer.unref();
           probe.once('connect', () => {
+            clearTimeout(probeTimer);
             probe.destroy();
             reject(new Error(
               `IPC path ${this.socketPath} is in use by a live process; refusing to unlink it ` +
@@ -575,12 +595,14 @@ export class IPCServer {
             ));
           });
           probe.once('error', () => {
+            clearTimeout(probeTimer);
             probe.destroy();
             // Nothing is listening — stale socket file from a crashed
             // predecessor (or a process killed after unlink but before bind).
             // Safe to remove and retry listen exactly once.
             try { unlinkSync(this.socketPath); } catch { /* ignore */ }
             this.server!.listen(this.socketPath, () => {
+              this.ownsSocketPath = true;
               console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
               resolve();
             });
@@ -598,6 +620,7 @@ export class IPCServer {
             /* Windows / no-op */
           }
         }
+        this.ownsSocketPath = true;
         console.log(`[ipc] Listening on ${this.socketPath}`);
         resolve();
       });
@@ -656,8 +679,14 @@ export class IPCServer {
     });
   }
 
-  /** Remove the Unix socket file (no-op on Windows named pipes). */
+  /**
+   * Remove the Unix socket file (no-op on Windows named pipes).
+   * Only unlinks when THIS instance owns the path — a contender that lost the
+   * EADDRINUSE race must never unlink the live owner's socket on its stop().
+   */
   private cleanupSocketFile(): void {
+    if (!this.ownsSocketPath) return;
+    this.ownsSocketPath = false;
     if (process.platform !== 'win32' && existsSync(this.socketPath)) {
       try {
         unlinkSync(this.socketPath);
