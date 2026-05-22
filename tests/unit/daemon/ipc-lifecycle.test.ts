@@ -171,4 +171,45 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     await expect(server.start()).resolves.toBeUndefined();
     await server.stop();
   });
+
+  it('a rejected start() does not poison the instance (retryable)', async () => {
+    const instanceId = uniqueInstanceId();
+    const blocker = makeServer(instanceId);
+    await blocker.start();
+
+    // Contender fails to bind (live owner). this.server must stay null so the
+    // SAME instance can retry start() once the path frees — not be wedged in
+    // a permanent "already started" state.
+    const contender = makeServer(instanceId);
+    await expect(contender.start()).rejects.toBeTruthy();
+
+    await blocker.stop();
+    await expect(contender.start()).resolves.toBeUndefined();
+    await contender.stop();
+  });
+
+  it('start() waits for an in-flight stop() and is not stranded by it', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+    await server.start();
+
+    // Do NOT await stop(): start() must internally wait for the in-flight stop
+    // so the old stop's teardown can't unlink the freshly-bound new socket.
+    const stopping = server.stop();
+    const starting = server.start();
+    await expect(starting).resolves.toBeUndefined();
+    await stopping;
+
+    // The newly-started server must be live and reachable.
+    const client = createConnection(getIpcPath(instanceId));
+    sockets.push(client);
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        client.once('connect', () => resolve());
+        client.once('error', reject);
+        setTimeout(() => reject(new Error('new server unreachable — in-flight stop stranded it')), 2000);
+      }),
+    ).resolves.toBeUndefined();
+    await server.stop();
+  });
 });

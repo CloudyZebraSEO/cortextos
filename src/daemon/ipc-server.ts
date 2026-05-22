@@ -499,10 +499,10 @@ export class IPCServer {
   private eaddrinuseRetried = false;
   /**
    * True only once THIS instance has successfully bound the socket path.
-   * cleanupSocketFile() unlinks only when this is set — otherwise a contender
-   * instance that lost the EADDRINUSE race (and never owned the path) could
-   * unlink the LIVE owner's socket on its own stop(), stranding the real
-   * daemon. Reset on every start().
+   * stop() captures this synchronously and unlinks the socket file only when
+   * set — otherwise a contender instance that lost the EADDRINUSE race (and
+   * never owned the path) could unlink the LIVE owner's socket on its own
+   * stop(), stranding the real daemon. Reset on every start().
    */
   private ownsSocketPath = false;
   /** In-flight stop() promise; dedups concurrent/repeated stop() calls. */
@@ -517,6 +517,12 @@ export class IPCServer {
    * Start listening for IPC connections.
    */
   async start(): Promise<void> {
+    // If a stop() is still in flight, wait for it to fully complete before
+    // (re)starting. Otherwise this start() could bind a new server while the
+    // previous stop's deferred teardown is still pending — and that teardown,
+    // reading instance state, could then unlink the freshly-bound socket.
+    if (this.stopPromise) await this.stopPromise;
+
     // Refuse to start twice on the same instance — a second start() would
     // reset ownership state and leak the first server. Lifecycle must be
     // start -> stop -> start, never start -> start.
@@ -544,8 +550,13 @@ export class IPCServer {
       try { unlinkSync(this.socketPath); } catch { /* ignore */ }
     }
 
-    return new Promise((resolve, reject) => {
-      this.server = createServer((socket: Socket) => {
+    return new Promise<void>((resolve, reject) => {
+      // Build the server in a LOCAL — this.server is committed only once
+      // listen() succeeds. A start() that rejects (live-owner conflict,
+      // EACCES, probe failure, …) must NOT leave this.server set, or the
+      // instance would be permanently poisoned ("already started") and the
+      // caller would have to know to stop() a server that never listened.
+      const server = createServer((socket: Socket) => {
         // Track the connection so stop() can tear it down, and untrack it
         // whenever it closes (normal end, error, or idle-timeout destroy).
         this.connections.add(socket);
@@ -573,6 +584,29 @@ export class IPCServer {
         });
       });
 
+      // Tear down a server that failed to come up and reject, leaving the
+      // instance reusable (this.server stays null, so start() can be retried).
+      const failStart = (err: Error): void => {
+        try { server.removeAllListeners(); } catch { /* ignore */ }
+        try { server.close(); } catch { /* ignore */ }
+        reject(err);
+      };
+
+      const onListening = (recovered: boolean): void => {
+        if (process.platform !== 'win32') {
+          try {
+            chmodSync(this.socketPath, 0o600);
+          } catch {
+            /* Windows / no-op */
+          }
+        }
+        // Commit ownership only now that THIS server holds the path.
+        this.server = server;
+        this.ownsSocketPath = true;
+        console.log(`[ipc] Listening on ${this.socketPath}${recovered ? ' (recovered from stale socket)' : ''}`);
+        resolve();
+      };
+
       // EADDRINUSE recovery. The previous implementation re-called listen()
       // from inside this handler with no guard: if the socket stayed in use
       // (e.g. an orphan daemon still holding the pipe — exactly the dup-poller
@@ -581,7 +615,7 @@ export class IPCServer {
       // loop that leaked listeners/handles and burned heap. Now we retry the
       // stale-socket cleanup at most once, then reject so the daemon surfaces
       // the real failure instead of looping.
-      this.server.on('error', (err: NodeJS.ErrnoException) => {
+      server.on('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE' && !this.eaddrinuseRetried) {
           this.eaddrinuseRetried = true;
           // Narrow race: a socket appeared between the start-top probe/unlink
@@ -591,36 +625,21 @@ export class IPCServer {
           // when nothing is listening; otherwise reject and surface the truth.
           this.probeSocketLive().then((live) => {
             if (live) {
-              reject(new Error(
+              failStart(new Error(
                 `IPC path ${this.socketPath} is in use by a live process; refusing to unlink it ` +
                 `(another daemon may already be running).`,
               ));
               return;
             }
             try { unlinkSync(this.socketPath); } catch { /* ignore */ }
-            this.server!.listen(this.socketPath, () => {
-              this.ownsSocketPath = true;
-              console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
-              resolve();
-            });
-          }).catch(reject);
+            server.listen(this.socketPath, () => onListening(true));
+          }).catch(failStart);
         } else {
-          reject(err);
+          failStart(err);
         }
       });
 
-      this.server.listen(this.socketPath, () => {
-        if (process.platform !== 'win32') {
-          try {
-            chmodSync(this.socketPath, 0o600);
-          } catch {
-            /* Windows / no-op */
-          }
-        }
-        this.ownsSocketPath = true;
-        console.log(`[ipc] Listening on ${this.socketPath}`);
-        resolve();
-      });
+      server.listen(this.socketPath, () => onListening(false));
     });
   }
 
@@ -671,20 +690,20 @@ export class IPCServer {
   /**
    * Stop the IPC server.
    *
-   * Resolves once the underlying server has fully closed. The critical
-   * teardown — destroying live sockets and calling server.close() — runs
-   * SYNCHRONOUSLY before the first await point, so a fire-and-forget caller
-   * inside a synchronous `process.on('exit')` handler still tears the server
-   * down correctly; only the close-completion await is skipped there.
+   * Resolves once the underlying server has fully closed. The teardown that
+   * matters for resource release — destroying live sockets, capturing
+   * ownership, nulling this.server, calling server.close(), and unlinking the
+   * socket file when we own it — all runs SYNCHRONOUSLY before the first await
+   * point. That is what makes a fire-and-forget call inside the synchronous
+   * `process.on('exit')` handler correct: only the close-completion await
+   * (and the cosmetic removeAllListeners) is skipped there.
    *
-   * Listener removal and socket-file cleanup are deferred to the close
-   * callback: stripping listeners before close() would hide the close
-   * lifecycle and race the path cleanup against the actual close.
+   * Ownership is captured into a LOCAL at call time, so the unlink decision
+   * can never be flipped by a concurrent start() mutating instance state.
    */
   stop(): Promise<void> {
     // A stop already in flight: return the same promise so a second stop()
-    // never runs cleanupSocketFile() (which unlinks an owned path) before the
-    // first close() callback has fired.
+    // never double-runs teardown before the first close() callback has fired.
     if (this.stopPromise) return this.stopPromise;
 
     // Destroy any still-open connections first. server.close() only stops
@@ -697,11 +716,20 @@ export class IPCServer {
     this.connections.clear();
 
     const server = this.server;
+    const owned = this.ownsSocketPath;
     this.server = null;
+    this.ownsSocketPath = false;
+
+    // Unlink the socket file synchronously when THIS stop owned it. Safe now
+    // (all connections destroyed; close initiated below) and — crucially —
+    // this is the only teardown step that can run when stop() is called
+    // fire-and-forget from the synchronous process.on('exit') handler, where
+    // async close callbacks never fire. Using the captured `owned` (not the
+    // live flag) means a concurrent start() can't make us unlink its socket.
+    if (owned) this.unlinkSocketFile();
 
     if (!server) {
       // Never started (or already fully stopped) — nothing async to wait on.
-      this.cleanupSocketFile();
       return Promise.resolve();
     }
 
@@ -715,7 +743,6 @@ export class IPCServer {
         // inherits stale handlers (the source of the "MaxListenersExceeded
         // Warning: 11 listeners" the daemon logged before this fix).
         server.removeAllListeners();
-        this.cleanupSocketFile();
         this.stopPromise = null;
         resolve();
       };
@@ -730,12 +757,13 @@ export class IPCServer {
 
   /**
    * Remove the Unix socket file (no-op on Windows named pipes).
-   * Only unlinks when THIS instance owns the path — a contender that lost the
-   * EADDRINUSE race must never unlink the live owner's socket on its stop().
+   *
+   * Unconditional: the ownership decision is made by the caller (stop()
+   * captures `owned` synchronously and only calls this when true). Keeping
+   * the gate out of here avoids reading mutable instance state that a
+   * concurrent start() could have changed.
    */
-  private cleanupSocketFile(): void {
-    if (!this.ownsSocketPath) return;
-    this.ownsSocketPath = false;
+  private unlinkSocketFile(): void {
     if (process.platform !== 'win32' && existsSync(this.socketPath)) {
       try {
         unlinkSync(this.socketPath);
