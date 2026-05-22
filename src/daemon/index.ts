@@ -334,10 +334,12 @@ class Daemon {
       console.log('[daemon] SIGUSR2 crash trigger ENABLED (debug mode)');
     }
 
-    // Fallback cleanup on exit (belt-and-suspenders for Windows)
+    // Fallback cleanup on exit (belt-and-suspenders for Windows). The 'exit'
+    // event is synchronous — async work and the IPC lifecycle chain cannot
+    // run here — so use disposeSync() rather than the queued stop().
     process.on('exit', () => {
       if (this.ipcServer) {
-        this.ipcServer.stop();
+        this.ipcServer.disposeSync();
       }
       try {
         const { unlinkSync } = require('fs');

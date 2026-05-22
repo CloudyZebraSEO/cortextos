@@ -514,10 +514,17 @@ export class IPCServer {
    * stop(), stranding the real daemon. Reset on every start().
    */
   private ownsSocketPath = false;
-  /** In-flight stop() promise; dedups concurrent/repeated stop() calls. */
-  private stopPromise: Promise<void> | null = null;
-  /** In-flight start() promise; rejects concurrent starts and lets stop() wait one out. */
-  private startPromise: Promise<void> | null = null;
+  /**
+   * Serializes every lifecycle operation. Each start()/stop() chains its work
+   * after the previous op's completion, so _doStart() and _doStop() can never
+   * overlap or interleave — this eliminates the whole class of start/stop race
+   * conditions (stop-before-start-commit, stop->start->stop ordering, repeated
+   * stop during an in-flight start) by construction rather than by hand-rolled
+   * promise interlocking. Failures are isolated to the caller's returned
+   * promise; the internal chain swallows them so one failed op cannot wedge
+   * every subsequent op.
+   */
+  private opChain: Promise<unknown> = Promise.resolve();
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
@@ -525,38 +532,30 @@ export class IPCServer {
   }
 
   /**
-   * Start listening for IPC connections.
-   *
-   * Serializes against itself and against stop(): a start already in progress
-   * makes a second start() reject (rather than racing two binds that share
-   * eaddrinuseRetried/ownsSocketPath), and stop() can observe startPromise to
-   * wait an in-flight start out before tearing down.
+   * Append an operation to the serialized lifecycle chain. The op runs only
+   * after the previous op fully settles (success or failure), guaranteeing
+   * start/stop never overlap. The caller gets a promise that resolves/rejects
+   * with the op's own outcome; the chain itself absorbs the outcome so a
+   * failed op doesn't poison the queue.
    */
-  async start(): Promise<void> {
-    if (this.startPromise) {
-      throw new Error('IPCServer.start() called while a start is already in progress');
-    }
-    const sp = this._doStart();
-    this.startPromise = sp;
-    try {
-      await sp;
-    } finally {
-      // Identity-guarded reset (symmetry with stop()): only clear if still the
-      // current handle.
-      if (this.startPromise === sp) this.startPromise = null;
-    }
+  private enqueue<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.opChain.then(op, op);
+    this.opChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * Start listening for IPC connections. Serialized via the lifecycle chain:
+   * runs after any in-flight start/stop, so it never races a concurrent op.
+   * A start() issued while already listening rejects ("already started").
+   */
+  start(): Promise<void> {
+    return this.enqueue(() => this._doStart());
   }
 
   private async _doStart(): Promise<void> {
-    // If a stop() is still in flight, wait for it to fully complete before
-    // (re)starting. Otherwise this start() could bind a new server while the
-    // previous stop's deferred teardown is still pending — and that teardown,
-    // reading instance state, could then unlink the freshly-bound socket.
-    if (this.stopPromise) await this.stopPromise;
-
-    // Refuse to start twice on the same instance — a second start() would
-    // reset ownership state and leak the first server. Lifecycle must be
-    // start -> stop -> start, never start -> start.
+    // Serialized by enqueue(), so no concurrent start/stop can be in flight
+    // here. A live this.server therefore means a genuine double-start.
     if (this.server) {
       throw new Error('IPCServer.start() called while already started');
     }
@@ -742,55 +741,49 @@ export class IPCServer {
   }
 
   /**
-   * Stop the IPC server. Resolves once the underlying server has fully closed.
+   * Stop the IPC server. Serialized via the lifecycle chain: runs after any
+   * in-flight start/stop, so repeated or interleaved stop() calls each tear
+   * down in order and never resolve before the actual close() completes.
+   * Resolves once the underlying server has fully closed.
    *
-   * Dedups concurrent stop() calls via stopPromise, and waits out an in-flight
-   * start() (if any) before tearing down so a late onListening() can't orphan
-   * a listening server. The resource-releasing teardown itself lives in
-   * _doStop() and runs synchronously up front (see its doc) so the synchronous
-   * process.on('exit') fire-and-forget path still releases everything.
+   * NOTE: this is async/queued and so does NOT run during a synchronous
+   * process.on('exit'). For that path the daemon calls disposeSync() instead.
    */
   stop(): Promise<void> {
-    // Check for an in-flight start FIRST. The authoritative "stopped" state is
-    // only reached after that start settles AND we tear down, so we must chain
-    // a fresh teardown after it — even if an earlier stopPromise already
-    // exists. Returning that earlier promise here would resolve before the
-    // queued start runs and leave the server listening (stop->start->stop
-    // race). Its deferred onListening() could otherwise commit this.server
-    // after we "stopped". (Unreachable on the synchronous process.on('exit')
-    // path: the daemon's boot start() resolved long before shutdown, so the
-    // synchronous teardown in _doStop() below still applies there.)
-    if (this.startPromise) {
-      const start = this.startPromise;
-      const p = start
-        .catch(() => { /* start failed — it committed nothing to tear down */ })
-        .then(() => this._doStop());
-      this.stopPromise = p;
-      // Identity-guarded reset: only clear if still the current handle, so a
-      // newer stopPromise isn't nulled out from under a live teardown.
-      void p.finally(() => { if (this.stopPromise === p) this.stopPromise = null; });
-      return p;
-    }
-
-    // No start in flight: dedup concurrent stop() calls on one teardown so a
-    // second stop() never double-runs it before the first close() fires.
-    if (this.stopPromise) return this.stopPromise;
-
-    const p = this._doStop();
-    this.stopPromise = p;
-    void p.finally(() => { if (this.stopPromise === p) this.stopPromise = null; });
-    return p;
+    return this.enqueue(() => this._doStop());
   }
 
   /**
-   * Actual teardown. The steps that matter for resource release — destroying
-   * live sockets, capturing ownership, nulling this.server, calling
-   * server.close(), and unlinking the socket file when we own it — all run
-   * SYNCHRONOUSLY before the first await point, so a fire-and-forget call from
-   * the synchronous process.on('exit') handler still releases everything;
-   * only the close-completion wait (and the cosmetic removeAllListeners) is
-   * skipped there. Ownership is captured into a LOCAL so the unlink decision
-   * can never be flipped by a concurrent start() mutating instance state.
+   * Synchronous best-effort teardown for the process.on('exit') path, where
+   * neither async work nor the lifecycle chain can run. Destroys live
+   * connections, unlinks the socket file if owned, and closes the server. Any
+   * async close completion is irrelevant — the process is dying and the OS
+   * reclaims the fds; a leftover Unix socket file is harmless because the next
+   * daemon's start() probes it, finds nothing listening, and unlinks it.
+   * Safe to call after stop() already ran (server null → no-op).
+   */
+  disposeSync(): void {
+    for (const socket of this.connections) {
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+    this.connections.clear();
+
+    const server = this.server;
+    const owned = this.ownsSocketPath;
+    this.server = null;
+    this.ownsSocketPath = false;
+
+    if (owned) this.unlinkSocketFile();
+    if (server) {
+      try { server.removeAllListeners(); server.close(); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Actual teardown, run serialized by enqueue() so no start/stop overlaps it.
+   * Destroys live connections, captures ownership into a LOCAL (so the unlink
+   * decision can't be flipped by other state), nulls this.server, unlinks the
+   * socket file when owned, then awaits server.close() and strips listeners.
    */
   private _doStop(): Promise<void> {
     // Destroy any still-open connections first. server.close() only stops
@@ -807,17 +800,9 @@ export class IPCServer {
     this.server = null;
     this.ownsSocketPath = false;
 
-    // Unlink the socket file synchronously when THIS stop owned it. Safe now
-    // (all connections destroyed; close initiated below). This is the only
-    // teardown step that can run when stop() reaches _doStop() fire-and-forget
-    // from the synchronous process.on('exit') handler, where async close
-    // callbacks never fire. Best-effort, not guaranteed: if a stop()/start()
-    // is already in flight when exit fires, _doStop() is deferred behind a
-    // promise that the dying event loop won't run, so the file may survive —
-    // but that is harmless, the next daemon's start() probes it, finds nothing
-    // listening, and unlinks the stale leftover. Using the captured `owned`
-    // (not the live flag) means a concurrent start() can't make us unlink its
-    // socket.
+    // Unlink the socket file when THIS stop owned it. Using the captured
+    // `owned` (not the live flag) means nothing else can make us unlink a path
+    // we don't own.
     if (owned) this.unlinkSocketFile();
 
     if (!server) {

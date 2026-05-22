@@ -218,12 +218,13 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     await contender.stop();
   });
 
-  it('concurrent start() calls reject the second (no shared-state race)', async () => {
+  it('concurrent start() calls reject the second (serialized, no shared-state race)', async () => {
     const instanceId = uniqueInstanceId();
     const server = makeServer(instanceId);
 
-    // Fire two starts without awaiting the first. Exactly one must win; the
-    // other must reject rather than race two binds over shared instance state.
+    // Fire two starts without awaiting the first. Both run serialized on the
+    // lifecycle chain: the first binds, the second then sees a live server and
+    // rejects ("already started"). Exactly one wins.
     const a = server.start();
     const b = server.start();
     const results = await Promise.allSettled([a, b]);
@@ -231,9 +232,29 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     const rejected = results.filter((r) => r.status === 'rejected');
     expect(fulfilled).toHaveLength(1);
     expect(rejected).toHaveLength(1);
-    expect(String((rejected[0] as PromiseRejectedResult).reason)).toMatch(/in progress/i);
+    expect(String((rejected[0] as PromiseRejectedResult).reason)).toMatch(/already started/i);
 
     await server.stop();
+  });
+
+  it('repeated stop() during an in-flight start() each settle after real teardown', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+
+    // Begin a start, then issue TWO stops before it resolves. Serialization
+    // must run start -> stop -> stop in order; neither stop may resolve before
+    // the actual close completes (the duplicate-stop-during-start race).
+    const starting = server.start();
+    const stopA = server.stop();
+    const stopB = server.stop();
+    await Promise.allSettled([starting, stopA, stopB]);
+
+    // After both stops settle the server is genuinely down: the path is free
+    // for an immediate re-bind. A premature stop resolution would leave the
+    // close pending and this would intermittently fail with EADDRINUSE.
+    const reuse = makeServer(instanceId);
+    await expect(reuse.start()).resolves.toBeUndefined();
+    await reuse.stop();
   });
 
   it('stop -> start -> stop resolves with the server actually down', async () => {
