@@ -792,7 +792,12 @@ describe('FastChecker', () => {
     it('fires exec after bootstrap at 50-min interval', async () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      // Large pollInterval: the 50-min fake-time advance below would otherwise
+      // drive ~3000 async poll cycles (default 1000ms interval), which is heavy
+      // enough to flakily exceed the 10s test timeout under load. The watchdog
+      // (separate 50-min setInterval) is independent of pollInterval, so this
+      // doesn't change what's under test — it just removes incidental churn.
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60 * 60 * 1000 });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execFile).toHaveBeenCalledWith(
@@ -809,7 +814,9 @@ describe('FastChecker', () => {
       const { execFile } = await import('child_process');
       const execMock = execFile as ReturnType<typeof vi.fn>;
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      // Large pollInterval — see the "fires exec" test above for rationale
+      // (avoids ~3000 incidental poll cycles during the 50-min advance).
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60 * 60 * 1000 });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       const callsBefore = execMock.mock.calls.length;
@@ -824,7 +831,8 @@ describe('FastChecker', () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');
       agent.isBootstrapped.mockReturnValue(false);
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      // Large pollInterval for consistency with the other watchdog tests.
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60 * 60 * 1000 });
       checker.start();
       await vi.advanceTimersByTimeAsync(20 * 1000);
       expect(execFile).not.toHaveBeenCalledWith(
