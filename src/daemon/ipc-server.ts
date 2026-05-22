@@ -485,6 +485,15 @@ export function handleRemoveCron(
  */
 const IPC_CONN_IDLE_MS = 30_000;
 
+/**
+ * Hard cap on a single inbound IPC request's accumulated bytes. The idle
+ * timeout only reaps a silent socket; a slow-drip or never-valid-JSON sender
+ * stays "active" and would otherwise grow the per-connection `data` buffer
+ * without bound. 1 MB is far above any real request (the largest responses,
+ * not requests, are list-all-crons / fleet-health).
+ */
+const MAX_IPC_REQUEST_BYTES = 1024 * 1024;
+
 export class IPCServer {
   private server: Server | null = null;
   private socketPath: string;
@@ -588,6 +597,16 @@ export class IPCServer {
         let data = '';
         socket.on('data', (chunk) => {
           data += chunk.toString();
+          // Cap the accumulated request buffer. The idle timeout above only
+          // catches a SILENT client — a slow-drip sender (one byte every <30s,
+          // or a flood of bytes that never form valid JSON) keeps resetting it
+          // while `data` grows without bound = the exact heap-growth class this
+          // fix exists to kill. No legitimate IPC request approaches 1 MB.
+          if (data.length > MAX_IPC_REQUEST_BYTES) {
+            console.warn(`[ipc] request exceeded ${MAX_IPC_REQUEST_BYTES} bytes — destroying connection`);
+            socket.destroy();
+            return;
+          }
           // Try to parse complete JSON messages
           try {
             const request: IPCRequest = JSON.parse(data);
@@ -765,11 +784,16 @@ export class IPCServer {
     this.ownsSocketPath = false;
 
     // Unlink the socket file synchronously when THIS stop owned it. Safe now
-    // (all connections destroyed; close initiated below) and — crucially —
-    // this is the only teardown step that can run when stop() is called
-    // fire-and-forget from the synchronous process.on('exit') handler, where
-    // async close callbacks never fire. Using the captured `owned` (not the
-    // live flag) means a concurrent start() can't make us unlink its socket.
+    // (all connections destroyed; close initiated below). This is the only
+    // teardown step that can run when stop() reaches _doStop() fire-and-forget
+    // from the synchronous process.on('exit') handler, where async close
+    // callbacks never fire. Best-effort, not guaranteed: if a stop()/start()
+    // is already in flight when exit fires, _doStop() is deferred behind a
+    // promise that the dying event loop won't run, so the file may survive —
+    // but that is harmless, the next daemon's start() probes it, finds nothing
+    // listening, and unlinks the stale leftover. Using the captured `owned`
+    // (not the live flag) means a concurrent start() can't make us unlink its
+    // socket.
     if (owned) this.unlinkSocketFile();
 
     if (!server) {

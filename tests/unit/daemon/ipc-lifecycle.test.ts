@@ -51,6 +51,33 @@ function makeServer(instanceId: string): IPCServer {
 }
 
 describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
+  it('destroys a connection that floods the read buffer past the cap', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+    await server.start();
+
+    const client = createConnection(getIpcPath(instanceId));
+    sockets.push(client);
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', () => resolve());
+      client.once('error', reject);
+    });
+
+    // Stream >1 MB of bytes that never form valid JSON. The server must cap
+    // the per-connection buffer and destroy the socket rather than letting
+    // `data` grow without bound (the slow-drip / never-valid-JSON heap vector).
+    const closed = new Promise<void>((resolve) => client.once('close', () => resolve()));
+    client.write('x'.repeat(1024 * 1024 + 1024));
+    await expect(
+      Promise.race([
+        closed,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('over-cap connection not destroyed')), 2000)),
+      ]),
+    ).resolves.toBeUndefined();
+
+    await server.stop();
+  });
+
   it('stop() destroys live inbound connections', async () => {
     const instanceId = uniqueInstanceId();
     const server = makeServer(instanceId);
