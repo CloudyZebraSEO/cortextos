@@ -507,6 +507,8 @@ export class IPCServer {
   private ownsSocketPath = false;
   /** In-flight stop() promise; dedups concurrent/repeated stop() calls. */
   private stopPromise: Promise<void> | null = null;
+  /** In-flight start() promise; rejects concurrent starts and lets stop() wait one out. */
+  private startPromise: Promise<void> | null = null;
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
@@ -515,8 +517,25 @@ export class IPCServer {
 
   /**
    * Start listening for IPC connections.
+   *
+   * Serializes against itself and against stop(): a start already in progress
+   * makes a second start() reject (rather than racing two binds that share
+   * eaddrinuseRetried/ownsSocketPath), and stop() can observe startPromise to
+   * wait an in-flight start out before tearing down.
    */
   async start(): Promise<void> {
+    if (this.startPromise) {
+      throw new Error('IPCServer.start() called while a start is already in progress');
+    }
+    this.startPromise = this._doStart();
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
+  }
+
+  private async _doStart(): Promise<void> {
     // If a stop() is still in flight, wait for it to fully complete before
     // (re)starting. Otherwise this start() could bind a new server while the
     // previous stop's deferred teardown is still pending — and that teardown,
@@ -688,24 +707,49 @@ export class IPCServer {
   }
 
   /**
-   * Stop the IPC server.
+   * Stop the IPC server. Resolves once the underlying server has fully closed.
    *
-   * Resolves once the underlying server has fully closed. The teardown that
-   * matters for resource release — destroying live sockets, capturing
-   * ownership, nulling this.server, calling server.close(), and unlinking the
-   * socket file when we own it — all runs SYNCHRONOUSLY before the first await
-   * point. That is what makes a fire-and-forget call inside the synchronous
-   * `process.on('exit')` handler correct: only the close-completion await
-   * (and the cosmetic removeAllListeners) is skipped there.
-   *
-   * Ownership is captured into a LOCAL at call time, so the unlink decision
-   * can never be flipped by a concurrent start() mutating instance state.
+   * Dedups concurrent stop() calls via stopPromise, and waits out an in-flight
+   * start() (if any) before tearing down so a late onListening() can't orphan
+   * a listening server. The resource-releasing teardown itself lives in
+   * _doStop() and runs synchronously up front (see its doc) so the synchronous
+   * process.on('exit') fire-and-forget path still releases everything.
    */
   stop(): Promise<void> {
     // A stop already in flight: return the same promise so a second stop()
     // never double-runs teardown before the first close() callback has fired.
     if (this.stopPromise) return this.stopPromise;
 
+    if (this.startPromise) {
+      // A start is still in flight. Wait it out before tearing down — its
+      // deferred onListening() could otherwise commit this.server AFTER we
+      // stopped, leaving an orphaned listening server. (Unreachable on the
+      // synchronous process.on('exit') path: the daemon's boot start()
+      // resolved long before shutdown, so there is no in-flight start there
+      // and the synchronous teardown in _doStop() still applies.)
+      this.stopPromise = this.startPromise
+        .catch(() => { /* start failed — it committed nothing to tear down */ })
+        .then(() => this._doStop());
+    } else {
+      this.stopPromise = this._doStop();
+    }
+    // Clear the handle once teardown settles so a later start->stop cycle is
+    // not wedged on a stale promise.
+    void this.stopPromise.finally(() => { this.stopPromise = null; });
+    return this.stopPromise;
+  }
+
+  /**
+   * Actual teardown. The steps that matter for resource release — destroying
+   * live sockets, capturing ownership, nulling this.server, calling
+   * server.close(), and unlinking the socket file when we own it — all run
+   * SYNCHRONOUSLY before the first await point, so a fire-and-forget call from
+   * the synchronous process.on('exit') handler still releases everything;
+   * only the close-completion wait (and the cosmetic removeAllListeners) is
+   * skipped there. Ownership is captured into a LOCAL so the unlink decision
+   * can never be flipped by a concurrent start() mutating instance state.
+   */
+  private _doStop(): Promise<void> {
     // Destroy any still-open connections first. server.close() only stops
     // accepting new connections — it does NOT close live sockets, and a
     // lingering socket keeps the server (and its listeners) referenced,
@@ -733,7 +777,7 @@ export class IPCServer {
       return Promise.resolve();
     }
 
-    this.stopPromise = new Promise<void>((resolve) => {
+    return new Promise<void>((resolve) => {
       let settled = false;
       const finish = () => {
         if (settled) return;
@@ -743,7 +787,6 @@ export class IPCServer {
         // inherits stale handlers (the source of the "MaxListenersExceeded
         // Warning: 11 listeners" the daemon logged before this fix).
         server.removeAllListeners();
-        this.stopPromise = null;
         resolve();
       };
       // close() stops accepting new connections and fires once all connections
@@ -752,7 +795,6 @@ export class IPCServer {
       // Safety net: never hang a caller if close() somehow never calls back.
       setTimeout(finish, 2000).unref();
     });
-    return this.stopPromise;
   }
 
   /**

@@ -188,6 +188,41 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     await contender.stop();
   });
 
+  it('concurrent start() calls reject the second (no shared-state race)', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+
+    // Fire two starts without awaiting the first. Exactly one must win; the
+    // other must reject rather than race two binds over shared instance state.
+    const a = server.start();
+    const b = server.start();
+    const results = await Promise.allSettled([a, b]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(String((rejected[0] as PromiseRejectedResult).reason)).toMatch(/in progress/i);
+
+    await server.stop();
+  });
+
+  it('stop() during an in-flight start() does not orphan a listening server', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+
+    // Begin start() but don't await it, then immediately stop(). stop() must
+    // wait the start out and tear it down — leaving nothing listening.
+    const starting = server.start();
+    const stopping = server.stop();
+    await Promise.allSettled([starting]);
+    await stopping;
+
+    // Path must be free: a brand-new server can bind it immediately.
+    const reuse = makeServer(instanceId);
+    await expect(reuse.start()).resolves.toBeUndefined();
+    await reuse.stop();
+  });
+
   it('start() waits for an in-flight stop() and is not stranded by it', async () => {
     const instanceId = uniqueInstanceId();
     const server = makeServer(instanceId);
