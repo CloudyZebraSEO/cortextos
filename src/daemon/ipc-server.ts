@@ -505,6 +505,8 @@ export class IPCServer {
    * daemon. Reset on every start().
    */
   private ownsSocketPath = false;
+  /** In-flight stop() promise; dedups concurrent/repeated stop() calls. */
+  private stopPromise: Promise<void> | null = null;
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
@@ -515,17 +517,32 @@ export class IPCServer {
    * Start listening for IPC connections.
    */
   async start(): Promise<void> {
-    // Clean up stale socket
-    if (process.platform !== 'win32' && existsSync(this.socketPath)) {
-      try {
-        unlinkSync(this.socketPath);
-      } catch {
-        // Ignore
-      }
+    // Refuse to start twice on the same instance — a second start() would
+    // reset ownership state and leak the first server. Lifecycle must be
+    // start -> stop -> start, never start -> start.
+    if (this.server) {
+      throw new Error('IPCServer.start() called while already started');
     }
 
     this.eaddrinuseRetried = false;
     this.ownsSocketPath = false;
+
+    // A leftover socket file does NOT prove the previous daemon is dead.
+    // Probe for a live owner before touching it: if something answers, refuse
+    // to start (another daemon owns the path — split-brain guard). Only when
+    // the probe confirms nothing is listening do we treat it as a stale
+    // leftover from a crashed predecessor and unlink it. (Windows named pipes
+    // are not filesystem entries, so existsSync is always false there and the
+    // EADDRINUSE handler below is the equivalent guard.)
+    if (process.platform !== 'win32' && existsSync(this.socketPath)) {
+      const live = await this.probeSocketLive();
+      if (live) {
+        throw new Error(
+          `IPC path ${this.socketPath} is owned by a live process; refusing to start a second daemon.`,
+        );
+      }
+      try { unlinkSync(this.socketPath); } catch { /* ignore */ }
+    }
 
     return new Promise((resolve, reject) => {
       this.server = createServer((socket: Socket) => {
@@ -567,46 +584,26 @@ export class IPCServer {
       this.server.on('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE' && !this.eaddrinuseRetried) {
           this.eaddrinuseRetried = true;
-          // Probe before unlinking. A generic EADDRINUSE does NOT prove the
-          // socket is stale: a LIVE predecessor daemon could still be holding
-          // the path (the dup-poller scenario in diag-daemon-oom-2026-05-21).
-          // Blindly unlinking would strand that live server's socket and let
-          // us bind the same path = split-brain / two daemons. So we connect
-          // first: if something answers, refuse and surface the real failure;
-          // only when the probe is refused (nothing listening) do we treat the
-          // path as a stale leftover, unlink it, and retry listen exactly once.
-          const probe = createConnection(this.socketPath);
-          // Bound the probe: if connect neither succeeds nor errors (platform
-          // edge case), don't hang start() forever — treat as inconclusive
-          // and reject rather than risk unlinking a possibly-live path.
-          const probeTimer = setTimeout(() => {
-            probe.destroy();
-            reject(new Error(
-              `IPC path ${this.socketPath} probe timed out; refusing to unlink (state unknown).`,
-            ));
-          }, 1_000);
-          probeTimer.unref();
-          probe.once('connect', () => {
-            clearTimeout(probeTimer);
-            probe.destroy();
-            reject(new Error(
-              `IPC path ${this.socketPath} is in use by a live process; refusing to unlink it ` +
-              `(another daemon may already be running).`,
-            ));
-          });
-          probe.once('error', () => {
-            clearTimeout(probeTimer);
-            probe.destroy();
-            // Nothing is listening — stale socket file from a crashed
-            // predecessor (or a process killed after unlink but before bind).
-            // Safe to remove and retry listen exactly once.
+          // Narrow race: a socket appeared between the start-top probe/unlink
+          // and listen() (e.g. a predecessor bound it, or a process was killed
+          // mid-bind). Re-probe before unlinking — blindly removing it could
+          // strand a live owner = split-brain. Only unlink + retry listen once
+          // when nothing is listening; otherwise reject and surface the truth.
+          this.probeSocketLive().then((live) => {
+            if (live) {
+              reject(new Error(
+                `IPC path ${this.socketPath} is in use by a live process; refusing to unlink it ` +
+                `(another daemon may already be running).`,
+              ));
+              return;
+            }
             try { unlinkSync(this.socketPath); } catch { /* ignore */ }
             this.server!.listen(this.socketPath, () => {
               this.ownsSocketPath = true;
               console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
               resolve();
             });
-          });
+          }).catch(reject);
         } else {
           reject(err);
         }
@@ -628,6 +625,50 @@ export class IPCServer {
   }
 
   /**
+   * Probe whether a process is currently listening on socketPath.
+   *
+   * Resolves `true` when a live listener accepts the connection, `false` when
+   * the path is provably stale (nothing listening — ECONNREFUSED/ENOENT).
+   * Rejects on an inconclusive error (EACCES/EPERM/etc.) or timeout, where
+   * unlinking would be unsafe: callers must NOT remove a path they cannot
+   * prove is dead. A single `settled` guard ensures exactly one outcome and
+   * detaches the probe's own listeners so a late event can't re-trigger the
+   * stale-socket branch after the promise already settled.
+   */
+  private probeSocketLive(): Promise<boolean> {
+    return new Promise<boolean>((resolve, reject) => {
+      const probe = createConnection(this.socketPath);
+      let settled = false;
+      const done = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        probe.removeAllListeners();
+        probe.destroy();
+        fn();
+      };
+      const timer = setTimeout(
+        () => done(() => reject(new Error(
+          `IPC path ${this.socketPath} liveness probe timed out (state unknown).`,
+        ))),
+        1_000,
+      );
+      timer.unref();
+      probe.once('connect', () => done(() => resolve(true)));
+      probe.once('error', (err: NodeJS.ErrnoException) => {
+        // ECONNREFUSED / ENOENT mean nothing is listening → stale path.
+        // Any other error (EACCES, EPERM, …) is inconclusive: reject so the
+        // caller refuses to unlink rather than risk stranding a live owner.
+        if (err.code === 'ECONNREFUSED' || err.code === 'ENOENT') {
+          done(() => resolve(false));
+        } else {
+          done(() => reject(err));
+        }
+      });
+    });
+  }
+
+  /**
    * Stop the IPC server.
    *
    * Resolves once the underlying server has fully closed. The critical
@@ -641,6 +682,11 @@ export class IPCServer {
    * lifecycle and race the path cleanup against the actual close.
    */
   stop(): Promise<void> {
+    // A stop already in flight: return the same promise so a second stop()
+    // never runs cleanupSocketFile() (which unlinks an owned path) before the
+    // first close() callback has fired.
+    if (this.stopPromise) return this.stopPromise;
+
     // Destroy any still-open connections first. server.close() only stops
     // accepting new connections — it does NOT close live sockets, and a
     // lingering socket keeps the server (and its listeners) referenced,
@@ -654,11 +700,12 @@ export class IPCServer {
     this.server = null;
 
     if (!server) {
+      // Never started (or already fully stopped) — nothing async to wait on.
       this.cleanupSocketFile();
       return Promise.resolve();
     }
 
-    return new Promise<void>((resolve) => {
+    this.stopPromise = new Promise<void>((resolve) => {
       let settled = false;
       const finish = () => {
         if (settled) return;
@@ -669,6 +716,7 @@ export class IPCServer {
         // Warning: 11 listeners" the daemon logged before this fix).
         server.removeAllListeners();
         this.cleanupSocketFile();
+        this.stopPromise = null;
         resolve();
       };
       // close() stops accepting new connections and fires once all connections
@@ -677,6 +725,7 @@ export class IPCServer {
       // Safety net: never hang a caller if close() somehow never calls back.
       setTimeout(finish, 2000).unref();
     });
+    return this.stopPromise;
   }
 
   /**

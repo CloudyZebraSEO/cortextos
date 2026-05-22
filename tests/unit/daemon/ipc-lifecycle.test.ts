@@ -147,4 +147,28 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
     await expect(server.start()).resolves.toBeUndefined();
     await server.stop();
   });
+
+  it('start() twice without stop() rejects (no double-bind / ownership reset)', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+    await server.start();
+    await expect(server.start()).rejects.toThrow(/already started/i);
+    await server.stop();
+  });
+
+  it('concurrent stop() calls dedup to one teardown and resolve cleanly', async () => {
+    const instanceId = uniqueInstanceId();
+    const server = makeServer(instanceId);
+    await server.start();
+
+    // Both calls must resolve without throwing; the second must not run a
+    // premature cleanup before the first close() completes.
+    const a = server.stop();
+    const b = server.stop();
+    await expect(Promise.all([a, b])).resolves.toBeDefined();
+
+    // Server is fully down and reusable.
+    await expect(server.start()).resolves.toBeUndefined();
+    await server.stop();
+  });
 });
