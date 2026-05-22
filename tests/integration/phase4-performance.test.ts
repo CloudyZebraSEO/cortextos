@@ -24,6 +24,11 @@ import path from 'path';
 import os from 'os';
 import { NextRequest } from 'next/server';
 
+// Heavy perf-integration suite — runs ONLY under PERF=1 (isolated perf job), so
+// absolute latency budgets are meaningful (no parallel-suite CPU/disk contention).
+// Default `vitest run` skips it = deterministic + faster. See aurex/codex 2026-05-22.
+const RUN_PERF = !!process.env.PERF;
+
 // ---------------------------------------------------------------------------
 // Temp root — separate from the backtest root to avoid cross-contamination
 // ---------------------------------------------------------------------------
@@ -132,6 +137,7 @@ let healthModule: typeof import('../../dashboard/src/app/api/workflows/health/ro
 let execModule: typeof import('../../dashboard/src/app/api/workflows/crons/[agent]/[name]/executions/route');
 
 beforeAll(async () => {
+  if (!RUN_PERF) return; // skip heavy 1000-cron setup when perf suite is gated off
   const allAgents: Record<string, { enabled: boolean; org: string }> = {};
   [...AGENTS_50, ...AGENTS_100].forEach(a => {
     allAgents[a] = { enabled: true, org: 'lifeos' };
@@ -189,23 +195,17 @@ afterAll(() => {
 
 const perfResults: Record<string, { p50: number; p95: number; count: number }> = {};
 
-// p95 budget for the hard assertions. These measure IN-PROCESS route-handler
-// latency, which inflates under heavy PARALLEL test-suite load (CPU/disk
-// contention from ~1900 other tests across workers) — that flaked the old hard
-// 2000ms gate in full-suite runs while passing solo. The real perf signal is
-// the logged solo p50/p95 (see console output); this assertion is a
-// gross-regression backstop tolerant of suite contention. Override with
-// PERF_P95_BUDGET_MS (e.g. `PERF_P95_BUDGET_MS=2000` for an isolated perf run).
-// Test-determinism only — no product/runtime change. Each test also retries to
-// absorb a single transient contention spike.
-const P95_BUDGET_MS = Number(process.env.PERF_P95_BUDGET_MS) || 10000;
+// Strict p95 budget. Meaningful because this whole perf-integration file runs
+// ISOLATED behind the PERF=1 gate (see RUN_PERF) — no parallel-suite contention
+// to inflate the measurement, so the original 2000ms target is the real signal.
+const P95_BUDGET_MS = 2000;
 
 // ---------------------------------------------------------------------------
 // GET /api/workflows/crons — 50-cron dataset
 // ---------------------------------------------------------------------------
 
-describe('Perf: GET /api/workflows/crons — 50 crons (5 agents)', () => {
-  it('p95 within budget', { retry: 2 }, async () => {
+describe.skipIf(!RUN_PERF)('Perf: GET /api/workflows/crons — 50 crons (5 agents)', () => {
+  it('p95 within budget', async () => {
     const samples = await bench(async () => {
       const req = new NextRequest('http://localhost/api/workflows/crons');
       const res = await cronsRootModule.GET(req);
@@ -230,8 +230,8 @@ describe('Perf: GET /api/workflows/crons — 50 crons (5 agents)', () => {
 // GET /api/workflows/crons — 100-cron dataset
 // ---------------------------------------------------------------------------
 
-describe('Perf: GET /api/workflows/crons — 100 crons (10 agents)', () => {
-  it('p95 within budget', { retry: 2 }, async () => {
+describe.skipIf(!RUN_PERF)('Perf: GET /api/workflows/crons — 100 crons (10 agents)', () => {
+  it('p95 within budget', async () => {
     const samples = await bench(async () => {
       const req = new NextRequest('http://localhost/api/workflows/crons');
       const res = await cronsRootModule.GET(req);
@@ -255,8 +255,8 @@ describe('Perf: GET /api/workflows/crons — 100 crons (10 agents)', () => {
 // GET /api/workflows/health — 50-cron dataset
 // ---------------------------------------------------------------------------
 
-describe('Perf: GET /api/workflows/health — 50 crons', () => {
-  it('p95 within budget', { retry: 2 }, async () => {
+describe.skipIf(!RUN_PERF)('Perf: GET /api/workflows/health — 50 crons', () => {
+  it('p95 within budget', async () => {
     const samples = await bench(async () => {
       const req = new NextRequest('http://localhost/api/workflows/health');
       const res = await healthModule.GET(req);
@@ -280,8 +280,8 @@ describe('Perf: GET /api/workflows/health — 50 crons', () => {
 // GET /api/workflows/health — 100-cron dataset (with heavy logs)
 // ---------------------------------------------------------------------------
 
-describe('Perf: GET /api/workflows/health — 100 crons + heavy logs', () => {
-  it('p95 within budget', { retry: 2 }, async () => {
+describe.skipIf(!RUN_PERF)('Perf: GET /api/workflows/health — 100 crons + heavy logs', () => {
+  it('p95 within budget', async () => {
     const samples = await bench(async () => {
       const req = new NextRequest('http://localhost/api/workflows/health');
       const res = await healthModule.GET(req);
@@ -305,8 +305,8 @@ describe('Perf: GET /api/workflows/health — 100 crons + heavy logs', () => {
 // GET /api/workflows/crons/[agent]/[name]/executions — 1000-entry log
 // ---------------------------------------------------------------------------
 
-describe('Perf: GET executions — 1000-entry log', () => {
-  it('p95 within budget', { retry: 2 }, async () => {
+describe.skipIf(!RUN_PERF)('Perf: GET executions — 1000-entry log', () => {
+  it('p95 within budget', async () => {
     const agent = 'perf-b1';
     const cronName = `perf-cron-${agent}-0`;
 
@@ -337,7 +337,7 @@ describe('Perf: GET executions — 1000-entry log', () => {
 // Summary assertion — all p95s < 2000ms
 // ---------------------------------------------------------------------------
 
-describe('Perf: all p95 within budget (summary)', () => {
+describe.skipIf(!RUN_PERF)('Perf: all p95 within budget (summary)', () => {
   it('reports accumulated results', () => {
     console.log('\n=== Phase 4 Performance Summary ===');
     for (const [key, { p50, p95, count }] of Object.entries(perfResults)) {

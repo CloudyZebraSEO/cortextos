@@ -38,6 +38,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
+// Heavy perf-integration suite — runs ONLY under PERF=1 (isolated perf job), so
+// absolute latency/timeout budgets are meaningful (no parallel-suite contention).
+// Default `vitest run` skips it = deterministic + faster. See aurex/codex 2026-05-22.
+const RUN_PERF = !!process.env.PERF;
+
 // ---------------------------------------------------------------------------
 // Module references — reloaded per test to pick up fresh CTX_ROOT
 // ---------------------------------------------------------------------------
@@ -63,6 +68,7 @@ let tmpRoot: string;
 const originalCtxRoot = process.env.CTX_ROOT;
 
 beforeEach(async () => {
+  if (!RUN_PERF) return; // skip heavy 1000-cron setup when perf suite is gated off
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-perf-'));
   process.env.CTX_ROOT = tmpRoot;
   // NOTE: fake timers are enabled only in tests that explicitly call vi.useFakeTimers()
@@ -197,7 +203,7 @@ const perfResults: Record<string, { measured: number; threshold: number; unit: s
 // P-1: Startup time — 1000 cron defs loaded in <5000ms
 // ===========================================================================
 
-describe('P-1: Startup time — 1000 crons ready in <5s', () => {
+describe.skipIf(!RUN_PERF)('P-1: Startup time — 1000 crons ready in <5s', () => {
   it('scheduler start() with 1000 crons (100 agents × 10) completes in <5000ms', async () => {
     // Build 100 agents × 10 crons = 1000 total definitions on disk
     const agents = populateFleet(100, 10);
@@ -254,7 +260,7 @@ describe('P-1: Startup time — 1000 crons ready in <5s', () => {
 // P-2: Fire latency — cron due fires within 1 minute (30s tick polling)
 // ===========================================================================
 
-describe('P-2: Fire latency — due cron fires within 1 min of schedule', () => {
+describe.skipIf(!RUN_PERF)('P-2: Fire latency — due cron fires within 1 min of schedule', () => {
   it('overdue cron fires on the very next tick (<30s after start)', async () => {
     vi.useFakeTimers();
     await reloadModules();
@@ -319,7 +325,7 @@ describe('P-2: Fire latency — due cron fires within 1 min of schedule', () => 
 // P-3: Polling overhead — scan 100 agents + 1000 crons in <10s
 // ===========================================================================
 
-describe('P-3: Polling overhead — 100 agents + 1000 crons scan in <10s', () => {
+describe.skipIf(!RUN_PERF)('P-3: Polling overhead — 100 agents + 1000 crons scan in <10s', () => {
   it('readCrons() across 100 agents × 10 crons completes in <10000ms', async () => {
     // Populate 100 agents × 10 crons = 1000 crons total
     const agents = populateFleet(100, 10);
@@ -376,7 +382,7 @@ describe('P-3: Polling overhead — 100 agents + 1000 crons scan in <10s', () =>
 // P-4: File I/O — read/write crons.json with 100 crons in <100ms
 // ===========================================================================
 
-describe('P-4: File I/O — read/write 100 crons per operation in <100ms', () => {
+describe.skipIf(!RUN_PERF)('P-4: File I/O — read/write 100 crons per operation in <100ms', () => {
   it('writeCrons() with 100 crons completes in <100ms', () => {
     const agent = 'p4-write-100';
     ensureAgentDir(agent);
@@ -452,7 +458,7 @@ describe('P-4: File I/O — read/write 100 crons per operation in <100ms', () =>
 // 30-second tick of the scheduler starting.
 // ===========================================================================
 
-describe('P-5: Concurrent fires — 100 simultaneous crons succeed in <30s (simulated)', () => {
+describe.skipIf(!RUN_PERF)('P-5: Concurrent fires — 100 simultaneous crons succeed in <30s (simulated)', () => {
   it('100 overdue crons all fire within one 30s tick (fast no-op PTY)', async () => {
     vi.useFakeTimers();
     await reloadModules();
@@ -591,7 +597,7 @@ describe('P-5: Concurrent fires — 100 simultaneous crons succeed in <30s (simu
 // P-6: Disk usage — 1000 crons.json + execution logs <100MB
 // ===========================================================================
 
-describe('P-6: Disk usage — 1000 crons.json + logs <100MB', () => {
+describe.skipIf(!RUN_PERF)('P-6: Disk usage — 1000 crons.json + logs <100MB', () => {
   it('1000 crons across 100 agents uses <100MB disk', () => {
     // Populate 100 agents × 10 crons = 1000 crons
     populateFleet(100, 10);
@@ -670,7 +676,7 @@ describe('P-6: Disk usage — 1000 crons.json + logs <100MB', () => {
 // SC-1: Scaling cliff — startup time at 500 / 1000 / 2000 crons on single agent
 // ===========================================================================
 
-describe('SC-1: Scaling cliff — startup time at 500/1000/2000 crons', () => {
+describe.skipIf(!RUN_PERF)('SC-1: Scaling cliff — startup time at 500/1000/2000 crons', () => {
   it('startup time scales sub-linearly: 500/1000/2000 crons measured', async () => {
     const sizes = [500, 1000, 2000];
     const results: { size: number; ms: number }[] = [];
@@ -722,7 +728,7 @@ describe('SC-1: Scaling cliff — startup time at 500/1000/2000 crons', () => {
 // SC-2: Scaling cliff — sequential fire drift at 1000 crons × 10ms PTY
 // ===========================================================================
 
-describe('SC-2: Scaling cliff — sequential fire drift at 1000 crons × 10ms PTY', () => {
+describe.skipIf(!RUN_PERF)('SC-2: Scaling cliff — sequential fire drift at 1000 crons × 10ms PTY', () => {
   it('1000 crons × 10ms PTY = ~10s tick latency documented as cliff', async () => {
     // AF-2 from phase5-failure-modes established 100 × 10ms = 1s (30x headroom).
     // This test extends to 1000 × 10ms = ~10s, which is ~3x the TICK_INTERVAL_MS (30s).
@@ -790,7 +796,7 @@ describe('SC-2: Scaling cliff — sequential fire drift at 1000 crons × 10ms PT
 // SC-3: File I/O scale — crons.json write at 500 / 1000 crons
 // ===========================================================================
 
-describe('SC-3: File I/O scale — writeCrons at 500 and 1000 crons', () => {
+describe.skipIf(!RUN_PERF)('SC-3: File I/O scale — writeCrons at 500 and 1000 crons', () => {
   it('writeCrons() with 500 crons <200ms; with 1000 crons <500ms', () => {
     const sizes = [500, 1000];
 
@@ -827,7 +833,7 @@ describe('SC-3: File I/O scale — writeCrons at 500 and 1000 crons', () => {
 // SC-4: Fleet scan scale — 200 and 500 agents
 // ===========================================================================
 
-describe('SC-4: Fleet scan scale — 200 and 500 agents', () => {
+describe.skipIf(!RUN_PERF)('SC-4: Fleet scan scale — 200 and 500 agents', () => {
   it('polling 200 agents × 5 crons (1000 total) stays under 10s', () => {
     const agents = populateFleet(200, 5);
 
@@ -883,7 +889,7 @@ describe('SC-4: Fleet scan scale — 200 and 500 agents', () => {
 // Summary — print all measured numbers
 // ===========================================================================
 
-describe('Phase 5 Performance Summary', () => {
+describe.skipIf(!RUN_PERF)('Phase 5 Performance Summary', () => {
   it('reports all measured results', () => {
     console.log('\n========================================');
     console.log('  Phase 5 Performance Summary (5.4)    ');
