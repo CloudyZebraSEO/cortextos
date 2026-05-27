@@ -976,6 +976,7 @@ export class CodexAppServerPTY {
       if (!env['LANG']) env['LANG'] = 'en_US.UTF-8';
       if (!env['LC_ALL']) env['LC_ALL'] = 'en_US.UTF-8';
       if (!process.env['PYTHONIOENCODING']) env['PYTHONIOENCODING'] = 'utf-8';
+      this.ensureWindowsCryptoEnv(env);
     }
 
     env['CTX_INSTANCE_ID'] = this._env.instanceId;
@@ -998,6 +999,59 @@ export class CodexAppServerPTY {
     }
 
     return env;
+  }
+
+  /**
+   * Guarantee the Windows env vars that bundled Node needs to seed its CSPRNG.
+   *
+   * The codex.cmd launcher runs a bundled Node whose OpenSSL RNG seeds at
+   * process-init via the Windows CNG `BCryptGenRandom` API. CNG resolves its
+   * RNG provider DLL (bcryptprimitives.dll) under `%SystemRoot%\System32`. If
+   * the spawned child's environment block omits `SystemRoot`, CNG cannot
+   * initialize, `RAND_bytes` fails, and Node aborts at startup with
+   * `Assertion failed: ncrypto::CSPRNG(nullptr, 0)` (exit 134) — the app-server
+   * socket never opens and we crash-loop.
+   *
+   * The plain keepVars pass-through is fragile: it only forwards SystemRoot if
+   * our OWN process inherited it. If this daemon is ever launched with a
+   * stripped environment, the child still crashes. So derive a guaranteed
+   * value (SystemRoot -> windir -> SystemDrive\Windows -> C:\Windows), mirror
+   * it to `windir`, and make sure `%SystemRoot%\System32` is on PATH so the CNG
+   * DLLs are loadable regardless of how PATH was assembled.
+   */
+  private ensureWindowsCryptoEnv(env: Record<string, string>): void {
+    // Resolve a raw root, preferring already-kept vars, then our own process,
+    // then derive from the drive. Normalize away trailing separators so we
+    // never emit a malformed `C:\Windows\\System32`.
+    const rawRoot =
+      env['SystemRoot'] ||
+      env['windir'] ||
+      process.env['SystemRoot'] ||
+      process.env['windir'] ||
+      '';
+    let systemRoot = rawRoot.replace(/[\\/]+$/, '');
+
+    // Derive the drive from SystemRoot when possible so a non-C: Windows
+    // install stays self-consistent; only fall back to inherited/ C:.
+    const driveFromRoot = /^([A-Za-z]:)/.exec(systemRoot)?.[1];
+    const systemDrive =
+      driveFromRoot || env['SystemDrive'] || process.env['SystemDrive'] || 'C:';
+    if (!systemRoot) systemRoot = `${systemDrive}\\Windows`;
+
+    // Force a single canonical root across both resolver names — a stale or
+    // mismatched inherited windir would otherwise point CNG at the wrong place.
+    env['SystemRoot'] = systemRoot;
+    env['windir'] = systemRoot;
+    env['SystemDrive'] = systemDrive;
+
+    const system32 = `${systemRoot}\\System32`;
+    const pathParts = (env['PATH'] || '').split(';').filter(Boolean);
+    const hasSystem32 = pathParts.some(
+      (p) => p.replace(/[\\/]+$/, '').toLowerCase() === system32.toLowerCase(),
+    );
+    if (!hasSystem32) {
+      env['PATH'] = pathParts.length ? `${env['PATH']};${system32}` : system32;
+    }
   }
 
   private loadEnvFile(path: string, env: Record<string, string>): void {
