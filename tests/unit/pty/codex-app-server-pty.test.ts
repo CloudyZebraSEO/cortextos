@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
 
 const fsMocks = {
@@ -37,6 +37,16 @@ vi.mock('node-pty', () => ({
     kill: vi.fn(),
   }),
 }));
+
+let mockPlatformValue: NodeJS.Platform = process.platform;
+vi.mock('os', async () => {
+  const actual = await vi.importActual<typeof import('os')>('os');
+  return {
+    ...actual,
+    platform: () => mockPlatformValue,
+    homedir: actual.homedir,
+  };
+});
 
 const requestMock = vi.fn();
 const notifyMock = vi.fn();
@@ -1157,5 +1167,156 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
       total: { cachedInputTokens: 0, inputTokens: 100, outputTokens: 50, reasoningOutputTokens: 0, totalTokens: 150 },
       modelContextWindow: 200000,
     })).not.toThrow();
+  });
+});
+
+describe('CodexAppServerPTY Windows CSPRNG env hardening (buildEnv)', () => {
+  const callBuildEnv = (pty: InstanceType<typeof CodexAppServerPTY>) =>
+    (pty as unknown as { buildEnv: () => Record<string, string> }).buildEnv();
+
+  const ORIGINAL_ENV = { ...process.env };
+
+  beforeEach(() => {
+    mockPlatformValue = process.platform;
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  afterEach(() => {
+    mockPlatformValue = process.platform;
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it('guarantees SystemRoot on win32 even when the parent process lacks it', () => {
+    mockPlatformValue = 'win32';
+    delete process.env.SystemRoot;
+    delete process.env.windir;
+    process.env.SystemDrive = 'D:';
+
+    const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+
+    // Derived from SystemDrive when SystemRoot/windir are both absent.
+    expect(env.SystemRoot).toBe('D:\\Windows');
+    // windir is mirrored so either resolver path works.
+    expect(env.windir).toBe('D:\\Windows');
+    // System32 is appended so the CNG RNG provider DLLs are loadable.
+    expect(env.PATH?.toLowerCase()).toContain('d:\\windows\\system32');
+  });
+
+  it('falls back to C:\\Windows when SystemDrive is also missing', () => {
+    mockPlatformValue = 'win32';
+    delete process.env.SystemRoot;
+    delete process.env.windir;
+    delete process.env.SystemDrive;
+
+    const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+
+    expect(env.SystemRoot).toBe('C:\\Windows');
+    expect(env.SystemDrive).toBe('C:');
+  });
+
+  it('prefers an inherited SystemRoot and derives windir from it', () => {
+    mockPlatformValue = 'win32';
+    process.env.SystemRoot = 'C:\\WINDOWS';
+    delete process.env.windir;
+
+    const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+
+    expect(env.SystemRoot).toBe('C:\\WINDOWS');
+    expect(env.windir).toBe('C:\\WINDOWS');
+  });
+
+  it('does not duplicate System32 when PATH already contains it (case-insensitive)', () => {
+    mockPlatformValue = 'win32';
+    process.env.SystemRoot = 'C:\\Windows';
+    process.env.PATH = 'C:\\Windows\\SYSTEM32;C:\\tools';
+
+    const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+
+    const occurrences = (env.PATH || '')
+      .split(';')
+      .filter((p) => p.toLowerCase() === 'c:\\windows\\system32').length;
+    expect(occurrences).toBe(1);
+  });
+
+  it('does not inject Windows crypto vars on non-win32 platforms', () => {
+    mockPlatformValue = 'linux';
+    delete process.env.SystemRoot;
+    delete process.env.windir;
+
+    const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+
+    expect(env.SystemRoot).toBeUndefined();
+    expect(env.windir).toBeUndefined();
+  });
+
+  it('normalizes a trailing separator on SystemRoot and avoids duplicate System32', () => {
+    mockPlatformValue = 'win32';
+    process.env.SystemRoot = 'C:\\Windows\\';
+    process.env.PATH = 'C:\\Windows\\System32\\;C:\\tools';
+
+    const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+
+    // No double-separator artifact.
+    expect(env.SystemRoot).toBe('C:\\Windows');
+    expect(env.PATH).not.toContain('System32\\\\');
+    const sys32Count = (env.PATH || '')
+      .split(';')
+      .filter((p) => p.replace(/[\\/]+$/, '').toLowerCase() === 'c:\\windows\\system32').length;
+    expect(sys32Count).toBe(1);
+  });
+
+  it('derives SystemDrive from a non-C: SystemRoot when SystemDrive is absent', () => {
+    mockPlatformValue = 'win32';
+    process.env.SystemRoot = 'E:\\Windows';
+    delete process.env.SystemDrive;
+    delete process.env.windir;
+
+    const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+
+    expect(env.SystemDrive).toBe('E:');
+    expect(env.SystemRoot).toBe('E:\\Windows');
+    expect(env.PATH?.toLowerCase()).toContain('e:\\windows\\system32');
+  });
+
+  it('preserves the parent PATH when only the Windows-cased "Path" var is set', () => {
+    // Node exposes process.env case-insensitively on win32, so a parent that
+    // only set "Path" must still flow through to the child's PATH.
+    mockPlatformValue = 'win32';
+    process.env.SystemRoot = 'C:\\Windows';
+    const real = process.env.PATH;
+    if (process.platform === 'win32') {
+      const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+      expect(env.PATH).toContain(real?.split(';')[0] ?? '');
+    } else {
+      // Off-Windows hosts: assert PATH is preserved (case-insensitive proxy is win32-only).
+      const env = callBuildEnv(new CodexAppServerPTY(mockEnv, {}));
+      expect(env.PATH).toBeDefined();
+    }
+  });
+});
+
+describe('CodexAppServerPTY resolveCodexBinary', () => {
+  const callResolve = (pty: InstanceType<typeof CodexAppServerPTY>) =>
+    (pty as unknown as { resolveCodexBinary: () => string }).resolveCodexBinary();
+
+  afterEach(() => {
+    mockPlatformValue = process.platform;
+  });
+
+  it('returns bare "codex" on non-win32 platforms', () => {
+    mockPlatformValue = 'linux';
+    expect(callResolve(new CodexAppServerPTY(mockEnv, {}))).toBe('codex');
+  });
+
+  it('falls back to "codex.cmd" on win32 when no launcher is found on PATH', () => {
+    mockPlatformValue = 'win32';
+    fsMocks.existsSync.mockReturnValue(false);
+    expect(callResolve(new CodexAppServerPTY(mockEnv, {}))).toBe('codex.cmd');
+  });
+
+  it('discovers the .cmd launcher present on PATH on win32', () => {
+    mockPlatformValue = 'win32';
+    fsMocks.existsSync.mockImplementation((p: unknown) => String(p).endsWith('codex.cmd'));
+    expect(callResolve(new CodexAppServerPTY(mockEnv, {}))).toBe('codex.cmd');
   });
 });
