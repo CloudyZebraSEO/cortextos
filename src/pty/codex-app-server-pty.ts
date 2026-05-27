@@ -2,13 +2,15 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } f
 import { join } from 'path';
 import { homedir, platform } from 'os';
 import { randomBytes } from 'crypto';
+import { createServer } from 'net';
+import { get as httpGet } from 'http';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
-import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
+import { WsUnixJsonRpcClient, type JsonRpcResponse, type RpcTarget } from '../utils/ws-unix-client.js';
 
 interface IPty {
   pid: number;
@@ -115,6 +117,11 @@ export class CodexAppServerPTY {
   private _socketPath: string;
   private _socketListenArg: string;
   private _socketCwd: string;
+  // Transport: 'unix' on POSIX (AF_UNIX socket file), 'ws' on win32 (loopback
+  // TCP WebSocket — AF_UNIX is non-functional in codex 0.128.0 on Windows).
+  private _listenKind: 'unix' | 'ws';
+  private _wsHost = '127.0.0.1';
+  private _wsPort = 0;
   private _threadStatePath: string;
   private _socketPointerPath: string;
   private _threadId: string | null = null;
@@ -129,10 +136,21 @@ export class CodexAppServerPTY {
     this._stateDir = join(env.ctxRoot, 'state', env.agentName);
     this._threadStatePath = join(this._stateDir, 'codex-app-server-thread.json');
     this._socketPointerPath = join(this._stateDir, 'codex-app-server-socket.json');
-    const socket = this.resolveSocketPath();
-    this._socketPath = socket.path;
-    this._socketListenArg = socket.listenArg;
-    this._socketCwd = socket.cwd;
+    // win32 uses a loopback ws:// listener (port allocated per spawn attempt);
+    // POSIX uses the AF_UNIX socket file. _socketPath/_socketListenArg/_socketCwd
+    // stay meaningful only for the unix transport.
+    if (platform() === 'win32') {
+      this._listenKind = 'ws';
+      this._socketPath = '';
+      this._socketListenArg = '';
+      this._socketCwd = this._stateDir;
+    } else {
+      this._listenKind = 'unix';
+      const socket = this.resolveSocketPath();
+      this._socketPath = socket.path;
+      this._socketListenArg = socket.listenArg;
+      this._socketCwd = socket.cwd;
+    }
     this._outputBuffer = new OutputBuffer(1000, logPath, BOOTSTRAP_PATTERN);
   }
 
@@ -393,6 +411,11 @@ export class CodexAppServerPTY {
     for (let attempt = 0; attempt < delays.length; attempt += 1) {
       try {
         this.removeSocket();
+        // ws: allocate a fresh loopback port per attempt so a retry never
+        // collides with a half-dead listener from the previous attempt.
+        if (this._listenKind === 'ws') {
+          this._wsPort = await allocateFreePort(this._wsHost);
+        }
         await this.startAppServer();
         return;
       } catch (err) {
@@ -416,10 +439,13 @@ export class CodexAppServerPTY {
       }
 
       const spawnFn = this._spawnFn!;
+      const listenArg = this._listenKind === 'ws'
+        ? `ws://${this._wsHost}:${this._wsPort}`
+        : this._socketListenArg;
       const pty = spawnFn(this.resolveCodexBinary(), [
         'app-server',
         '--enable', 'goals',
-        '--listen', this._socketListenArg,
+        '--listen', listenArg,
       ], {
         name: 'xterm-256color',
         cols: 200,
@@ -447,8 +473,24 @@ export class CodexAppServerPTY {
     });
   }
 
-  private async waitForSocket(timeoutMs = 10000): Promise<void> {
+  private async waitForSocket(timeoutMs = 15000): Promise<void> {
     const start = Date.now();
+    // ws (win32): the app-server exposes /readyz once the WebSocket listener is
+    // accepting — a true readiness signal (port-open can precede readiness).
+    if (this._listenKind === 'ws') {
+      let lastErr = '';
+      while (Date.now() - start < timeoutMs) {
+        try {
+          await httpReadyz(this._wsHost, this._wsPort);
+          return;
+        } catch (err) {
+          lastErr = (err as Error).message;
+        }
+        await sleep(150);
+      }
+      throw new Error(`Timed out waiting for app-server readyz at ${this._wsHost}:${this._wsPort} (${lastErr})`);
+    }
+    // unix (POSIX): wait for the AF_UNIX socket file to appear.
     while (Date.now() - start < timeoutMs) {
       if (existsSync(this._socketPath)) return;
       await sleep(100);
@@ -457,7 +499,10 @@ export class CodexAppServerPTY {
   }
 
   private async connectRpc(): Promise<void> {
-    this._rpc = new WsUnixJsonRpcClient(this._socketPath);
+    const target: RpcTarget = this._listenKind === 'ws'
+      ? { host: this._wsHost, port: this._wsPort }
+      : this._socketPath;
+    this._rpc = new WsUnixJsonRpcClient(target);
     this._rpc.onMessage((message) => this.handleRpcMessage(message));
     await this._rpc.connect();
   }
@@ -894,6 +939,8 @@ export class CodexAppServerPTY {
   }
 
   private removeSocket(): void {
+    // ws transport has no on-disk socket file to clean up.
+    if (this._listenKind !== 'unix') return;
     try {
       if (existsSync(this._socketPath)) unlinkSync(this._socketPath);
     } catch {
@@ -1086,4 +1133,40 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Allocate a free loopback TCP port by binding to port 0 and reading back the
+ * OS-assigned port. There is a small TOCTOU window between close and the
+ * app-server re-binding it, but the ephemeral range makes a collision unlikely
+ * and a clash surfaces as a spawn-attempt failure that the retry loop handles.
+ */
+function allocateFreePort(host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once('error', reject);
+    srv.listen(0, host, () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      srv.close(() => (port ? resolve(port) : reject(new Error('failed to allocate free port'))));
+    });
+  });
+}
+
+/**
+ * Resolve when codex app-server's HTTP readiness endpoint returns 2xx. Used as
+ * the ws:// readiness gate — port-open can precede the WebSocket listener being
+ * ready to accept, so /readyz is the authoritative signal.
+ */
+function httpReadyz(host: string, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const req = httpGet({ host, port, path: '/readyz', timeout: 2000 }, (res) => {
+      const status = res.statusCode ?? 0;
+      res.resume(); // drain
+      if (status >= 200 && status < 300) resolve();
+      else reject(new Error(`readyz status ${status}`));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('readyz timeout')));
+  });
 }

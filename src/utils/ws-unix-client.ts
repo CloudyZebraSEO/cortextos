@@ -31,13 +31,18 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** Connection target: a Unix socket path (POSIX) or a TCP host/port (win32 ws://). */
+export type RpcTarget = string | { host: string; port: number };
+
 /**
- * Minimal WebSocket-over-Unix JSON-RPC client.
+ * Minimal WebSocket JSON-RPC client for codex app-server.
  *
- * Codex app-server's `unix://` transport is WebSocket-framed. The JSON-RPC
- * payloads inside text frames are newline-delimited, matching the stdio
- * transport after the WebSocket layer is removed. This helper intentionally
- * uses Node built-ins only so the app-server adapter adds no runtime deps.
+ * Codex app-server's `unix://` and `ws://` transports are BOTH WebSocket-framed
+ * and carry identical newline-delimited JSON-RPC payloads inside text frames —
+ * the only difference is the underlying byte stream (AF_UNIX socket vs TCP).
+ * AF_UNIX is non-functional on Windows in codex 0.128.0, so win32 listens on
+ * `ws://127.0.0.1:<port>` and connects via TCP here; POSIX keeps the Unix path.
+ * This helper intentionally uses Node built-ins only so the adapter adds no deps.
  */
 export class WsUnixJsonRpcClient {
   private socket: Socket | null = null;
@@ -46,12 +51,14 @@ export class WsUnixJsonRpcClient {
   private pending = new Map<number | string, PendingRequest>();
   private handlers: MessageHandler[] = [];
 
-  constructor(private readonly socketPath: string) {}
+  constructor(private readonly target: RpcTarget) {}
 
   async connect(): Promise<void> {
     if (this.socket) return;
 
-    const socket = createConnection(this.socketPath);
+    const socket = typeof this.target === 'string'
+      ? createConnection(this.target)
+      : createConnection(this.target.port, this.target.host);
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve);
       socket.once('error', reject);

@@ -76,6 +76,7 @@ vi.mock('../../../src/bus/event.js', () => ({
 }));
 
 const { CodexAppServerPTY } = await import('../../../src/pty/codex-app-server-pty.js');
+const { WsUnixJsonRpcClient } = await import('../../../src/utils/ws-unix-client.js');
 
 const mockEnv = {
   instanceId: 'test',
@@ -100,11 +101,17 @@ beforeEach(() => {
   logEventMock.mockReset();
   atomicWriteSyncMock.mockReset();
   messageHandler = null;
+  (WsUnixJsonRpcClient as unknown as { mockClear(): void }).mockClear();
 });
 
-describe('CodexAppServerPTY socket path policy', () => {
+describe('CodexAppServerPTY socket path policy (POSIX unix:// transport)', () => {
+  // These assert the AF_UNIX socket-file policy, which only applies off-Windows.
+  beforeEach(() => { mockPlatformValue = 'linux'; });
+  afterEach(() => { mockPlatformValue = process.platform; });
+
   it('uses codex.sock in the agent state dir by default', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
+    expect((pty as unknown as { _listenKind: string })._listenKind).toBe('unix');
     expect((pty as unknown as { _socketPath: string })._socketPath).toBe(join('/tmp/ctx/state/codex-app-agent', 'codex.sock'));
     expect((pty as unknown as { _socketListenArg: string })._socketListenArg).toBe('unix://./codex.sock');
   });
@@ -124,6 +131,41 @@ describe('CodexAppServerPTY socket path policy', () => {
       expect.stringContaining('"fallback": true'),
       'utf-8',
     );
+  });
+
+  it('connectRpc targets the AF_UNIX socket path on POSIX', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    await (pty as unknown as { connectRpc(): Promise<void> }).connectRpc();
+    expect(WsUnixJsonRpcClient).toHaveBeenCalledWith(join('/tmp/ctx/state/codex-app-agent', 'codex.sock'));
+  });
+});
+
+describe('CodexAppServerPTY transport policy (win32 ws:// transport)', () => {
+  // AF_UNIX is non-functional in codex 0.128.0 on Windows; win32 must use a
+  // loopback ws:// listener instead of a unix socket file.
+  beforeEach(() => { mockPlatformValue = 'win32'; });
+  afterEach(() => { mockPlatformValue = process.platform; });
+
+  it('selects the ws transport with no on-disk socket file on win32', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    expect((pty as unknown as { _listenKind: string })._listenKind).toBe('ws');
+    expect((pty as unknown as { _socketPath: string })._socketPath).toBe('');
+    expect((pty as unknown as { _wsHost: string })._wsHost).toBe('127.0.0.1');
+    // socket cwd still points at the agent state dir (harmless for ws).
+    expect((pty as unknown as { _socketCwd: string })._socketCwd).toBe(join('/tmp/ctx/state/codex-app-agent'));
+  });
+
+  it('connectRpc targets loopback host/port over TCP on win32', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _wsPort: number })._wsPort = 54321;
+    await (pty as unknown as { connectRpc(): Promise<void> }).connectRpc();
+    expect(WsUnixJsonRpcClient).toHaveBeenCalledWith({ host: '127.0.0.1', port: 54321 });
+  });
+
+  it('removeSocket is a no-op for the ws transport (no socket file to unlink)', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { removeSocket(): void }).removeSocket();
+    expect(fsMocks.unlinkSync).not.toHaveBeenCalled();
   });
 });
 
