@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { homedir, platform } from 'os';
 import { randomBytes } from 'crypto';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
@@ -416,7 +416,7 @@ export class CodexAppServerPTY {
       }
 
       const spawnFn = this._spawnFn!;
-      const pty = spawnFn('codex', [
+      const pty = spawnFn(this.resolveCodexBinary(), [
         'app-server',
         '--enable', 'goals',
         '--listen', this._socketListenArg,
@@ -930,12 +930,52 @@ export class CodexAppServerPTY {
     this._telegramApi.sendChatAction(this._chatId, 'typing').catch(() => { /* non-fatal */ });
   }
 
+  /**
+   * Resolve the codex CLI launcher name for the current platform.
+   *
+   * On Windows, npm global installs ship `codex` (POSIX shim), `codex.cmd`,
+   * and `codex.ps1` — there is no `codex.exe`. node-pty/ConPTY's CreateProcess
+   * cannot launch the extensionless shim and fails with "Cannot create process,
+   * error code: 2" (ERROR_FILE_NOT_FOUND). Probe PATH for the `.cmd` wrapper
+   * (or a future `.exe`) and return its bare name so node-pty resolves it.
+   */
+  private resolveCodexBinary(): string {
+    if (platform() !== 'win32') return 'codex';
+    const pathDirs = (process.env.PATH || '').split(';').filter(Boolean);
+    for (const ext of ['.exe', '.cmd']) {
+      for (const dir of pathDirs) {
+        if (existsSync(join(dir, `codex${ext}`))) {
+          return `codex${ext}`;
+        }
+      }
+    }
+    return 'codex.cmd';
+  }
+
   private buildEnv(): Record<string, string> {
     const env: Record<string, string> = {};
 
-    const keepVars = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'];
+    const keepVars = [
+      'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
+      'TMPDIR', 'TEMP', 'TMP', 'NODE_PATH', 'COMSPEC', 'PATHEXT', 'USERPROFILE',
+      // Windows essentials. Stripping SystemRoot/windir makes the bundled Node
+      // in codex.cmd crash at startup with `Assertion failed: ncrypto::CSPRNG`
+      // (OpenSSL RNG cannot seed without the Windows crypto DLLs SystemRoot
+      // resolves) — the app-server socket then never opens and we crash-loop.
+      'SystemDrive', 'SystemRoot', 'windir',
+      'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ALLUSERSPROFILE',
+      'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+      'HOMEDRIVE', 'HOMEPATH', 'PUBLIC',
+    ];
     for (const key of keepVars) {
       if (process.env[key]) env[key] = process.env[key]!;
+    }
+
+    // Windows: ensure UTF-8 locale so emoji/Unicode survive the PTY round-trip.
+    if (platform() === 'win32') {
+      if (!env['LANG']) env['LANG'] = 'en_US.UTF-8';
+      if (!env['LC_ALL']) env['LC_ALL'] = 'en_US.UTF-8';
+      if (!process.env['PYTHONIOENCODING']) env['PYTHONIOENCODING'] = 'utf-8';
     }
 
     env['CTX_INSTANCE_ID'] = this._env.instanceId;
