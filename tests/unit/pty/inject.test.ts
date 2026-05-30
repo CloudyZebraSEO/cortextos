@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { MessageDedup, KEYS, injectMessage } from '../../../src/pty/inject';
+import { MessageDedup, KEYS, MESSAGE_SUBMIT, injectMessage } from '../../../src/pty/inject';
 
 describe('MessageDedup', () => {
   it('detects duplicate content', () => {
@@ -35,7 +35,7 @@ describe('KEYS', () => {
   });
 });
 
-describe('injectMessage — deferred Enter crash safety', () => {
+describe('injectMessage - deferred submit safety', () => {
   // Regression guard for the 2026-04-22 storm. worker-process.ts:93 passed
   // an unsafe `this.pty!.write` callback; when PTY was torn down during the
   // 300ms enterDelay window the setTimeout fired null.write → uncaught
@@ -77,7 +77,7 @@ describe('injectMessage — deferred Enter crash safety', () => {
     expect(warnSpy.mock.calls[0][0]).toMatch(/deferred Enter failed/);
   });
 
-  it('sends Enter normally when the PTY stays alive', () => {
+  it('sends CRLF submit normally when the PTY stays alive', () => {
     const writes: string[] = [];
     const write = (data: string) => { writes.push(data); };
 
@@ -85,9 +85,33 @@ describe('injectMessage — deferred Enter crash safety', () => {
     const writesBeforeTimer = writes.length;
     vi.advanceTimersByTime(300);
 
-    // Exactly one new write — the ENTER keystroke — and no warn.
+    // Exactly one new write, the CRLF submit sequence, and no warn.
     expect(writes.length).toBe(writesBeforeTimer + 1);
-    expect(writes[writes.length - 1]).toBe(KEYS.ENTER);
+    expect(writes[writes.length - 1]).toBe(MESSAGE_SUBMIT);
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('submits an idle prompt that swallowed the old lone-CR Enter', () => {
+    const content = '[CRON FIRED 2026-05-30T14:58:41.045Z] heartbeat: Read HEARTBEAT.md';
+    let promptBuffer = '';
+    let submitted = false;
+
+    const write = (data: string) => {
+      if (data === KEYS.ENTER) {
+        return;
+      }
+      if (data === MESSAGE_SUBMIT || data === '\n') {
+        submitted = promptBuffer.includes(content);
+        return;
+      }
+      promptBuffer += data;
+    };
+
+    injectMessage(write, content, 300);
+
+    expect(submitted).toBe(false);
+    vi.advanceTimersByTime(300);
+
+    expect(submitted).toBe(true);
   });
 });

@@ -3,6 +3,7 @@ import { createHash } from 'crypto';
 // Bracketed paste mode escape sequences
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
+export const MESSAGE_SUBMIT = '\r\n';
 
 // Key escape sequences for TUI navigation
 export const KEYS = {
@@ -79,7 +80,10 @@ export function injectMessage(
     write(PASTE_END);
   }
 
-  // Send Enter after a short delay to submit the pasted content.
+  // Send CRLF after a short delay to submit the pasted content.
+  // Claude Code's idle prompt can echo a bracketed paste but ignore a lone CR,
+  // leaving cron injections visible in the prompt and never processed. CRLF
+  // matches the complete line ending used by the shutdown path for /exit.
   // Why the try/catch: the write callback captures `this.pty` (or similar
   // nullable PTY handle) via closure in callers. If the PTY is torn down
   // during the enterDelay window — e.g. hard-restart IPC kills the child —
@@ -90,7 +94,7 @@ export function injectMessage(
   // that covers every present and future caller.
   setTimeout(() => {
     try {
-      write(KEYS.ENTER);
+      write(MESSAGE_SUBMIT);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.warn(`[inject] deferred Enter failed (pty likely torn down): ${msg}`);
