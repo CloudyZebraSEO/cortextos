@@ -452,6 +452,7 @@ export class CodexAppServerPTY {
         rows: 50,
         cwd: this._socketCwd,
         env: this.buildEnv(),
+        useConpty: true,
       });
 
       this._appServerPty = pty;

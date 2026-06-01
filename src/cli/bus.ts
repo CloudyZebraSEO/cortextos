@@ -2710,10 +2710,11 @@ busCommand
       'ToolSearch', 'CronCreate', 'CronList', 'CronDelete',
       'Skill', 'Agent',
     ];
+    const nodeDirectCommand = (args: string) => `"${process.execPath}" "${join(frameworkRoot, 'dist', 'cli.js')}" ${args}`;
     const STATUS_LINE = {
       type: 'command',
-      command: 'cortextos bus hook-context-status',
-      refreshInterval: 5,
+      command: nodeDirectCommand('bus hook-context-status'),
+      refreshInterval: 300,
       timeout: 2,
     };
 
@@ -2745,6 +2746,9 @@ busCommand
 
         // Check statusLine
         if (!settings.statusLine) changes.push('statusLine: add hook-context-status');
+        else if (settings.statusLine.command !== STATUS_LINE.command || settings.statusLine.refreshInterval !== STATUS_LINE.refreshInterval) {
+          changes.push('statusLine: node-direct + 300s refresh');
+        }
 
         if (changes.length === 0) {
           console.log(`  OK   ${agent}: already up to date`);

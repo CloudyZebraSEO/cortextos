@@ -416,6 +416,8 @@ function findTemplateDir(projectRoot: string, template: string): string | null {
 }
 
 function copyTemplateFiles(templateDir: string, agentDir: string, name: string, org: string): void {
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || process.cwd();
+  const cliPath = join(frameworkRoot, 'dist', 'cli.js');
   const files = readdirSync(templateDir);
   for (const file of files) {
     const srcPath = join(templateDir, file);
@@ -428,6 +430,8 @@ function copyTemplateFiles(templateDir: string, agentDir: string, name: string, 
         content = content.replace(/\{\{agent_name\}\}/g, name);
         content = content.replace(/\{\{org\}\}/g, org);
         content = content.replace(/\{\{current_timestamp\}\}/g, new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'));
+        content = content.replace(/__CTX_NODE__/g, process.execPath);
+        content = content.replace(/__CTX_CLI__/g, cliPath);
         writeFileSync(destPath, content, 'utf-8');
       } else if (stat.isDirectory() && file !== 'node_modules') {
         mkdirSync(destPath, { recursive: true });

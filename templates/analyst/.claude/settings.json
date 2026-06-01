@@ -20,8 +20,8 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "cortextos bus hook-context-status",
-    "refreshInterval": 60,
+    "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-context-status",
+    "refreshInterval": 300,
     "timeout": 2
   },
   "hooks": {
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortextos bus hook-planmode-telegram",
+            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-planmode-telegram",
             "timeout": 1860
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortextos bus hook-permission-telegram",
+            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-permission-telegram",
             "timeout": 1860
           }
         ]
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortextos bus hook-loop-detector",
+            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-loop-detector",
             "timeout": 5
           }
         ]
@@ -61,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortextos bus hook-ask-telegram",
+            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-ask-telegram",
             "timeout": 10
           }
         ]
@@ -72,7 +72,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortextos bus hook-idle-flag",
+            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-idle-flag",
             "timeout": 5
           }
         ]
@@ -83,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortextos crash-alert",
+            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" crash-alert",
             "timeout": 10
           }
         ]
@@ -94,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortextos bus hook-compact-telegram",
+            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-compact-telegram",
             "timeout": 10
           }
         ]

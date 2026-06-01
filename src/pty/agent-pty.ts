@@ -149,6 +149,7 @@ export class AgentPTY {
       rows: 50,
       cwd,
       env: ptyEnv,
+      useConpty: true,
     });
 
     this._alive = true;
