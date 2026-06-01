@@ -21,7 +21,7 @@
   "statusLine": {
     "type": "command",
     "command": "cortextos bus hook-context-status",
-    "refreshInterval": 5,
+    "refreshInterval": 60,
     "timeout": 2
   },
   "hooks": {
