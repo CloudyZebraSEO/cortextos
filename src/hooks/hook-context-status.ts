@@ -54,7 +54,7 @@ async function main(): Promise<void> {
     process.stdin.on('end', resolve);
     process.stdin.on('error', resolve);
     // Timeout safety: don't block forever
-    setTimeout(resolve, 1500);
+    setTimeout(resolve, 1500).unref();
   });
 
   let data: StatusLineInput = {};
@@ -78,4 +78,4 @@ async function main(): Promise<void> {
   atomicWriteSync(outPath, payload);
 }
 
-main().catch(() => process.exit(0));
+main().catch(() => {}).finally(() => process.exit(0));

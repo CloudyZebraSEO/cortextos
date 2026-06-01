@@ -415,6 +415,17 @@ function findTemplateDir(projectRoot: string, template: string): string | null {
   return null;
 }
 
+export function renderTemplateContent(content: string, name: string, org: string, nodePath = process.execPath, cliPath?: string): string {
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || process.cwd();
+  const resolvedCliPath = cliPath || join(frameworkRoot, 'dist', 'cli.js');
+  return content
+    .replace(/\{\{agent_name\}\}/g, name)
+    .replace(/\{\{org\}\}/g, org)
+    .replace(/\{\{current_timestamp\}\}/g, new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'))
+    .replace(/__CTX_NODE__/g, nodePath.replace(/\\/g, '/'))
+    .replace(/__CTX_CLI__/g, resolvedCliPath.replace(/\\/g, '/'));
+}
+
 function copyTemplateFiles(templateDir: string, agentDir: string, name: string, org: string): void {
   const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || process.cwd();
   const cliPath = join(frameworkRoot, 'dist', 'cli.js');
@@ -426,12 +437,7 @@ function copyTemplateFiles(templateDir: string, agentDir: string, name: string, 
       const stat = require('fs').statSync(srcPath);
       if (stat.isFile()) {
         let content = readFileSync(srcPath, 'utf-8');
-        // Replace template placeholders
-        content = content.replace(/\{\{agent_name\}\}/g, name);
-        content = content.replace(/\{\{org\}\}/g, org);
-        content = content.replace(/\{\{current_timestamp\}\}/g, new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'));
-        content = content.replace(/__CTX_NODE__/g, process.execPath);
-        content = content.replace(/__CTX_CLI__/g, cliPath);
+        content = renderTemplateContent(content, name, org, process.execPath, cliPath);
         writeFileSync(destPath, content, 'utf-8');
       } else if (stat.isDirectory() && file !== 'node_modules') {
         mkdirSync(destPath, { recursive: true });

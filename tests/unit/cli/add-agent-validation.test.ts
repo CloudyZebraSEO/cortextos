@@ -16,7 +16,7 @@
  * the caller gets a clear error before any filesystem state is touched.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { addAgentCommand } from '../../../src/cli/add-agent';
+import { addAgentCommand, renderTemplateContent } from '../../../src/cli/add-agent';
 
 describe('BUG-041: add-agent agent name validation', () => {
   afterEach(() => {
@@ -154,5 +154,39 @@ describe('issue #407: add-agent --org name validation', () => {
     ).rejects.toThrow(/__TEST_PROCESS_EXIT_1__/);
 
     expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+});
+
+describe('add-agent template placeholder rendering', () => {
+  it('escapes Windows node and CLI paths so rendered settings JSON parses', () => {
+    const template = JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: '"__CTX_NODE__" "__CTX_CLI__" bus hook-save-prompt',
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const rendered = renderTemplateContent(
+      template,
+      'validagent',
+      'testorg',
+      'C:\\Program Files\\nodejs\\node.exe',
+      'C:\\Users\\steve\\cortextos\\dist\\cli.js',
+    );
+
+    expect(() => JSON.parse(rendered)).not.toThrow();
+    const settings = JSON.parse(rendered);
+    const command = settings.hooks.UserPromptSubmit[0].hooks[0].command;
+    expect(command).toContain('C:/Program Files/nodejs/node.exe');
+    expect(command).toContain('C:/Users/steve/cortextos/dist/cli.js');
+    expect(command).not.toContain('C:\\');
   });
 });
