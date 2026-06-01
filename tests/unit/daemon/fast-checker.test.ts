@@ -800,12 +800,15 @@ describe('FastChecker', () => {
       const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60 * 60 * 1000 });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
-      expect(execFile).toHaveBeenCalledWith(
-        'cortextos',
-        expect.arrayContaining(['bus', 'update-heartbeat', expect.stringContaining('[watchdog] my-agent alive — idle session')]),
-        expect.objectContaining({ windowsHide: true }),
-        expect.any(Function),
-      );
+      expect(execFile).toHaveBeenCalled();
+      const calls = (execFile as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls.some(([, args, opts]) => {
+        const argv = args as string[];
+        return argv.includes('bus')
+          && argv.includes('update-heartbeat')
+          && argv.some((arg) => String(arg).includes('[watchdog] my-agent alive — idle session'))
+          && (opts as { windowsHide?: boolean }).windowsHide === true;
+      })).toBe(true);
       checker.stop();
       checker.wake();
     });

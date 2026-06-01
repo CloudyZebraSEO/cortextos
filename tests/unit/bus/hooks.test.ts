@@ -9,8 +9,8 @@ import { tmpdir } from 'os';
 import type { Event } from '../../../src/types/index';
 
 // Capture every execFile invocation so we can assert which bus event was emitted.
-// The dispatcher uses execFile('cortextos', ['bus', 'log-event', 'action', <name>, 'info', '--meta', <json>])
-// fire-and-forget — we intercept before it spawns anything.
+// The dispatcher emits `cortextos bus log-event action <name> ...`; the concrete
+// exec wrapper may be PATH lookup or node + dist/cli.js.
 const execFileCalls: Array<{ cmd: string; args: string[] }> = [];
 vi.mock('child_process', () => ({
   execFile: (cmd: string, args: string[], _opts: unknown, cb?: () => void) => {
@@ -63,8 +63,8 @@ function makeHook(overrides: Partial<HookEntry> = {}): HookEntry {
 function lastEmittedEvent(): { name: string; meta: Record<string, unknown> } | null {
   if (execFileCalls.length === 0) return null;
   const args = execFileCalls[execFileCalls.length - 1].args;
-  // shape: [bus, log-event, action, <name>, info, --meta, <json>]
-  const name = args[3];
+  const actionIdx = args.indexOf('action');
+  const name = actionIdx >= 0 ? args[actionIdx + 1] : '';
   const metaIdx = args.indexOf('--meta');
   const meta = metaIdx >= 0 && metaIdx + 1 < args.length ? JSON.parse(args[metaIdx + 1]) : {};
   return { name, meta };
