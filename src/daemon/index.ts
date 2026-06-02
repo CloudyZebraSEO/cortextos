@@ -210,16 +210,24 @@ export function countPm2GodDaemons(): number {
   }
 }
 
-function abortOnDualPm2GodDaemon(frameworkRoot: string): void {
+function warnOnDualPm2GodDaemon(frameworkRoot: string): void {
   const count = countPm2GodDaemons();
   if (count <= 1) return;
+  // Detection + operator alert ONLY — deliberately does NOT abort startup.
+  // Aborting here is actively harmful: in a genuine dual-God scenario BOTH
+  // cortextos-daemons run this check, both see count>1, and both exit(1) —
+  // taking the whole fleet down, which is the exact outage this work fixes.
+  // The IPC pipe handshake (probeSocketLive) already arbitrates a single safe
+  // owner at bind time, so we surface the anomaly loudly and continue.
+  // NOTE: count is system-wide (matches any pm2/lib/Daemon.js regardless of
+  // PM2_HOME) — a 2nd unrelated pm2 project will alert but no longer brick us.
+  // Follow-up: scope the match to our pinned PM2_HOME for precision.
   const message =
-    `🚨 CRITICAL: multiple PM2 God daemons detected\n` +
-    `${count} processes match pm2/lib/Daemon.js.\n` +
-    `Aborting cortextOS daemon startup to avoid split-brain process supervision.`;
+    `⚠️ cortextOS: ${count} PM2 God daemons detected (expected 1).\n` +
+    `If they share this PM2_HOME it risks split-brain supervision; the IPC ` +
+    `handshake will still bind a single owner. Investigate duplicate pm2 startup.`;
   console.error(`[daemon] ${message.replace(/\n/g, ' ')}`);
   sendOperatorTelegramMessageBestEffort(frameworkRoot, message, 'Dual PM2 God daemon alert');
-  process.exit(1);
 }
 
 /**
@@ -286,7 +294,7 @@ class Daemon {
       process.exit(1);
     }
 
-    abortOnDualPm2GodDaemon(frameworkRoot);
+    warnOnDualPm2GodDaemon(frameworkRoot);
 
     // Write PID file
     const pidFile = join(this.ctxRoot, 'daemon.pid');
