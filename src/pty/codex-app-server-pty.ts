@@ -579,21 +579,36 @@ export class CodexAppServerPTY {
 
   private queueTurn(input: unknown[]): void {
     this._turnQueue.push(input);
-    if (!this._executing) {
-      this.drainQueue().catch((err) => {
-        this._outputBuffer.push(`[codex-app-server] turn queue failed: ${err}\n`);
-      });
-    }
+    this.kickDrainQueue();
+  }
+
+  private kickDrainQueue(): void {
+    if (this._executing || !this._alive || this._turnQueue.length === 0) return;
+    this.drainQueue().catch((err) => {
+      this._outputBuffer.push(`[codex-app-server] turn queue failed: ${err}\n`);
+      this._executing = false;
+      if (this._alive && this._turnQueue.length > 0) {
+        this.kickDrainQueue();
+      }
+    });
   }
 
   private async drainQueue(): Promise<void> {
-    while (this._alive && this._turnQueue.length > 0) {
-      const input = this._turnQueue.shift()!;
-      this._executing = true;
-      try {
-        await this.startTurn(input);
-      } finally {
-        this._executing = false;
+    if (this._executing) return;
+    this._executing = true;
+    try {
+      while (this._alive && this._turnQueue.length > 0) {
+        const input = this._turnQueue.shift()!;
+        try {
+          await this.startTurn(input);
+        } catch (err) {
+          this._outputBuffer.push(`[codex-app-server] dropping failed turn input: ${err}\n`);
+        }
+      }
+    } finally {
+      this._executing = false;
+      if (this._alive && this._turnQueue.length > 0) {
+        this.kickDrainQueue();
       }
     }
   }
