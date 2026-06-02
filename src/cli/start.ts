@@ -7,6 +7,7 @@ import { IPCClient } from '../daemon/ipc-server.js';
 
 const IS_WINDOWS = platform() === 'win32';
 const SAFE_CMD = /^[@a-z0-9._/-]+$/i;
+const CANONICAL_PM2_HOME = 'C:\\Users\\steve\\.pm2';
 
 function commandExists(cmd: string): boolean {
   if (!SAFE_CMD.test(cmd)) return false;
@@ -48,6 +49,7 @@ export const startCommand = new Command('start')
 
       const daemonEnv = {
         ...process.env,
+        ...(IS_WINDOWS ? { PM2_HOME: CANONICAL_PM2_HOME } : {}),
         CTX_INSTANCE_ID: options.instance,
         CTX_ROOT: ctxRoot,
         CTX_FRAMEWORK_ROOT: projectRoot,
@@ -77,8 +79,8 @@ export const startCommand = new Command('start')
         if (existsSync(ecosystemPath)) {
           console.log('Starting cortextOS daemon via PM2...');
           try {
-            execSync('pm2 start ecosystem.config.js', { stdio: 'inherit', cwd: projectRoot });
-            execSync('pm2 save', { stdio: 'inherit', cwd: projectRoot });
+            execSync('pm2 start ecosystem.config.js', { stdio: 'inherit', cwd: projectRoot, env: daemonEnv });
+            execSync('pm2 save', { stdio: 'inherit', cwd: projectRoot, env: daemonEnv });
             console.log('\nDaemon started. Use `cortextos status` to check agents.');
             if (IS_WINDOWS) {
               console.log('\nFor auto-start on Windows boot:');
@@ -96,8 +98,8 @@ export const startCommand = new Command('start')
               cwd: projectRoot,
               env: daemonEnv,
             });
-            execSync('pm2 start ecosystem.config.js', { stdio: 'inherit', cwd: projectRoot });
-            execSync('pm2 save', { stdio: 'inherit', cwd: projectRoot });
+            execSync('pm2 start ecosystem.config.js', { stdio: 'inherit', cwd: projectRoot, env: daemonEnv });
+            execSync('pm2 save', { stdio: 'inherit', cwd: projectRoot, env: daemonEnv });
             console.log('\nDaemon started. Use `cortextos status` to check agents.');
             if (IS_WINDOWS) {
               console.log('\nFor auto-start on Windows boot:');

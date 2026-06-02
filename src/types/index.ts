@@ -612,6 +612,7 @@ export interface BusPaths {
 // IPC Types
 
 export type IPCCommandType =
+  | 'ping'
   | 'status'
   | 'start-agent'
   | 'stop-agent'
@@ -728,6 +729,7 @@ export interface IPCRequest {
   type: IPCCommandType;
   agent?: string;
   data?: Record<string, unknown>;
+  nonce?: number;
   /**
    * BUG-015: human-readable identifier of the caller (e.g. 'cortextos enable',
    * 'cortextos bus soft-restart-all'). Logged by the daemon on every incoming
@@ -754,6 +756,7 @@ export interface WorkerStatus {
 export interface IPCResponse {
   success: boolean;
   data?: unknown;
+  pong?: number;
   error?: string;
   /**
    * Structured error code for failed responses. Lets operators distinguish

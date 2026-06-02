@@ -1,6 +1,8 @@
 import { createServer, createConnection, Server, Socket } from 'net';
 import { existsSync, unlinkSync, chmodSync, readFileSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
+import { randomInt } from 'crypto';
+import { platform } from 'os';
 import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '../types/index.js';
 import { AgentManager } from './agent-manager.js';
 import { getIpcPath } from '../utils/paths.js';
@@ -710,23 +712,60 @@ export class IPCServer {
   private probeSocketLive(): Promise<boolean> {
     return new Promise<boolean>((resolve, reject) => {
       const probe = createConnection(this.socketPath);
+      const isWindows = platform() === 'win32';
+      const nonce = isWindows ? randomInt(1, 0x1_0000_0000) : undefined;
       let settled = false;
+      const retryTimers: ReturnType<typeof setTimeout>[] = [];
       const done = (fn: () => void): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        for (const retryTimer of retryTimers) clearTimeout(retryTimer);
         probe.removeAllListeners();
         probe.destroy();
         fn();
       };
       const timer = setTimeout(
-        () => done(() => reject(new Error(
-          `IPC path ${this.socketPath} liveness probe timed out (state unknown).`,
-        ))),
-        1_000,
+        () => done(() => {
+          if (isWindows) {
+            resolve(false);
+          } else {
+            reject(new Error(`IPC path ${this.socketPath} liveness probe timed out (state unknown).`));
+          }
+        }),
+        isWindows ? 3_000 : 1_000,
       );
       timer.unref();
-      probe.once('connect', () => done(() => resolve(true)));
+      probe.once('connect', () => {
+        if (!isWindows) {
+          done(() => resolve(true));
+          return;
+        }
+
+        const payload = JSON.stringify({ type: 'ping', nonce, source: 'ipc-probe' });
+        const sendPing = () => {
+          if (!settled) probe.write(payload);
+        };
+        sendPing();
+        for (const delay of [1_000, 2_000]) {
+          const retryTimer = setTimeout(sendPing, delay);
+          retryTimer.unref();
+          retryTimers.push(retryTimer);
+        }
+      });
+      let data = '';
+      probe.on('data', (chunk: Buffer) => {
+        if (!isWindows) return;
+        data += chunk.toString();
+        try {
+          const response = JSON.parse(data) as IPCResponse;
+          if (response.success && response.pong === nonce) {
+            done(() => resolve(true));
+          }
+        } catch {
+          // Wait for a complete JSON response.
+        }
+      });
       probe.once('error', (err: NodeJS.ErrnoException) => {
         // ECONNREFUSED / ENOENT mean nothing is listening → stale path.
         // Any other error (EACCES, EPERM, …) is inconclusive: reject so the
@@ -863,6 +902,12 @@ export class IPCServer {
 
     try {
       switch (request.type) {
+        case 'ping':
+          response = request.nonce === undefined
+            ? { success: true }
+            : { success: true, pong: request.nonce };
+          break;
+
         case 'status':
           response = {
             success: true,

@@ -58,14 +58,34 @@ if (-not $pm2Bin) {
 
 # Verify the user has run `pm2 save` at least once. Without a dump file,
 # `pm2 resurrect` does nothing useful at logon.
-$dumpFile = Join-Path $env:USERPROFILE '.pm2\dump.pm2'
+$pm2Home = 'C:\Users\steve\.pm2'
+$dumpFile = Join-Path $pm2Home 'dump.pm2'
 if (-not (Test-Path $dumpFile)) {
     Write-Warning "PM2 dump file not found at $dumpFile."
     Write-Warning "Run 'pm2 save' AFTER starting your processes, otherwise resurrect has nothing to restore."
 }
 
-# Compose the action: node.exe <pm2-bin> resurrect
-$action = New-ScheduledTaskAction -Execute $node -Argument "`"$pm2Bin`" resurrect"
+# Compose the action through a guard script. PM2 resurrect is not idempotent
+# enough for dual logon/startup triggers, so the script uses an atomic mkdir
+# lock and skips resurrect when a PM2 God daemon already answers ping.
+$guardCmd = Join-Path $PSScriptRoot 'pm2-resurrect-guard.cmd'
+$guardContent = @"
+@echo off
+REM cortextOS: only resurrect if no PM2 God daemon is already alive.
+REM Uses an atomic mkdir lock to avoid dual logon resurrect races.
+set "PM2_HOME=$pm2Home"
+mkdir "%PM2_HOME%\resurrect.lock" 2>NUL || exit /b 0
+"$node" "$pm2Bin" ping >NUL 2>&1
+if errorlevel 1 (
+  "$node" "$pm2Bin" resurrect
+) else (
+  echo [pm2-resurrect-guard] God daemon already alive - skipping resurrect.
+)
+rmdir "%PM2_HOME%\resurrect.lock" 2>NUL
+"@
+Set-Content -Path $guardCmd -Value $guardContent -Encoding ASCII
+
+$action = New-ScheduledTaskAction -Execute $env:ComSpec -Argument "/c `"$guardCmd`""
 
 # Trigger at the current user's logon. AtLogon (not AtStartup) avoids needing
 # admin rights / SYSTEM-level service config; Task Scheduler runs under your
@@ -101,7 +121,7 @@ Register-ScheduledTask `
 Write-Host ""
 Write-Host "[ok] Registered scheduled task: $TaskName"
 Write-Host "      Trigger:   At logon ($env:USERDOMAIN\$env:USERNAME)"
-Write-Host "      Action:    $node `"$pm2Bin`" resurrect"
+Write-Host "      Action:    $env:ComSpec /c `"$guardCmd`""
 Write-Host ""
 Write-Host "Verify with:  Get-ScheduledTask -TaskName '$TaskName' | Get-ScheduledTaskInfo"
 Write-Host "Test now:     Start-ScheduledTask -TaskName '$TaskName'"
