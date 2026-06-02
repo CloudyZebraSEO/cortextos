@@ -8,6 +8,8 @@ describe('Windows PM2 startup guard', () => {
 
     expect(script).toContain("$pm2Home = 'C:\\Users\\steve\\.pm2'");
     expect(script).toContain('set "PM2_HOME=$pm2Home"');
+    expect(script).toContain("TotalMinutes -gt 5");
+    expect(script).toContain("Remove-Item -LiteralPath `$p -Recurse -Force");
     expect(script).toContain('mkdir "%PM2_HOME%\\resurrect.lock" 2>NUL || exit /b 0');
     expect(script).toContain('"$node" "$pm2Bin" ping >NUL 2>&1');
     expect(script).toContain('"$node" "$pm2Bin" resurrect');
