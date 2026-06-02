@@ -8,6 +8,10 @@ describe('Windows PM2 startup guard', () => {
 
     expect(script).toContain("$pm2Home = 'C:\\Users\\steve\\.pm2'");
     expect(script).toContain('set "PM2_HOME=$pm2Home"');
+    // Regression guard: the stale-lock sweep $p assignment MUST be backtick-escaped
+    // in the here-string, else it expands to empty at install-time and the
+    // generated .cmd sweep silently no-ops (Gemini delta-review finding 2026-06-02).
+    expect(script).toContain("`$p = Join-Path `$env:PM2_HOME");
     expect(script).toContain("TotalMinutes -gt 5");
     expect(script).toContain("Remove-Item -LiteralPath `$p -Recurse -Force");
     expect(script).toContain('mkdir "%PM2_HOME%\\resurrect.lock" 2>NUL || exit /b 0');

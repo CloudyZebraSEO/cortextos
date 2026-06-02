@@ -74,7 +74,7 @@ $guardContent = @"
 REM cortextOS: only resurrect if no PM2 God daemon is already alive.
 REM Uses an atomic mkdir lock to avoid dual logon resurrect races.
 set "PM2_HOME=$pm2Home"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Join-Path `$env:PM2_HOME 'resurrect.lock'; if ((Test-Path -LiteralPath `$p) -and (((Get-Date) - (Get-Item -LiteralPath `$p).LastWriteTime).TotalMinutes -gt 5)) { Remove-Item -LiteralPath `$p -Recurse -Force -ErrorAction SilentlyContinue }" >NUL 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "`$p = Join-Path `$env:PM2_HOME 'resurrect.lock'; if ((Test-Path -LiteralPath `$p) -and (((Get-Date) - (Get-Item -LiteralPath `$p).LastWriteTime).TotalMinutes -gt 5)) { Remove-Item -LiteralPath `$p -Recurse -Force -ErrorAction SilentlyContinue }" >NUL 2>&1
 mkdir "%PM2_HOME%\resurrect.lock" 2>NUL || exit /b 0
 "$node" "$pm2Bin" ping >NUL 2>&1
 if errorlevel 1 (
