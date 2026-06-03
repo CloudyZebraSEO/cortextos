@@ -546,6 +546,29 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
 
     internals.handleRpcMessage({ method: 'turn/completed', params: {} });
   });
+
+  it('drops a failed queued turn and keeps draining later inputs', async () => {
+    const pty = makeReadyPty();
+    const startTurn = vi.fn()
+      .mockRejectedValueOnce(new Error('poison input'))
+      .mockResolvedValueOnce(undefined);
+    (pty as unknown as { startTurn(input: unknown[]): Promise<void> }).startTurn = startTurn;
+
+    pty.write('bad');
+    pty.write('\r');
+    pty.write('good');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(startTurn).toHaveBeenCalledTimes(2);
+    expect(startTurn).toHaveBeenNthCalledWith(1, [{ type: 'text', text: 'bad', text_elements: [] }]);
+    expect(startTurn).toHaveBeenNthCalledWith(2, [{ type: 'text', text: 'good', text_elements: [] }]);
+    expect(pty.getOutputBuffer().getRecent()).toContain('dropping failed turn input: Error: poison input');
+    expect((pty as unknown as { _executing: boolean })._executing).toBe(false);
+    expect((pty as unknown as { _turnQueue: unknown[] })._turnQueue).toEqual([]);
+  });
 });
 
 describe('CodexAppServerPTY extractTelegramPayload media types', () => {
