@@ -261,6 +261,9 @@ export function classifyFromMarkers(
 }
 
 async function main(): Promise<void> {
+  const hardExit = setTimeout(() => process.exit(0), 12_000);
+  hardExit.unref();
+
   const agentName = process.env.CTX_AGENT_NAME;
   const instanceId = process.env.CTX_INSTANCE_ID || 'default';
   if (!agentName) return;
@@ -437,11 +440,19 @@ async function main(): Promise<void> {
   if (message) {
     try {
       const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-      await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: message }),
-      });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8_000);
+      timeout.unref();
+      try {
+        await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: message }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch { /* ignore send failures */ }
   }
 }

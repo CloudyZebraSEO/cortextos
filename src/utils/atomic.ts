@@ -2,6 +2,38 @@ import { writeFileSync, renameSync, mkdirSync, existsSync, copyFileSync } from '
 import { dirname, join } from 'path';
 import { randomBytes } from 'crypto';
 
+const RETRYABLE_RENAME_ERRORS = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+function isRetryableRenameError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return typeof code === 'string' && RETRYABLE_RENAME_ERRORS.has(code);
+}
+
+function busyWait(delayMs: number): void {
+  const end = Date.now() + delayMs;
+  while (Date.now() < end) {
+    // Intentionally synchronous: atomicWriteSync has no async yield point, and
+    // this keeps the retry bounded without using Atomics.wait on the main thread.
+  }
+}
+
+function renameSyncWithRetry(tmpPath: string, filePath: string): void {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      renameSync(tmpPath, filePath);
+      return;
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableRenameError(err) || attempt === 4) {
+        throw err;
+      }
+      busyWait(Math.min(50, 10 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
 /**
  * Atomically write data to a file by writing to a temp file first,
  * then renaming. Rename is atomic on the same filesystem.
@@ -28,7 +60,7 @@ export function atomicWriteSync(filePath: string, data: string, keepBak = false)
   const tmpPath = join(dir, `.tmp.${randomBytes(6).toString('hex')}`);
   try {
     writeFileSync(tmpPath, data + '\n', { encoding: 'utf-8', mode: 0o600 });
-    renameSync(tmpPath, filePath);
+    renameSyncWithRetry(tmpPath, filePath);
   } catch (err) {
     // Clean up temp file on failure
     try {

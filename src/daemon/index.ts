@@ -152,17 +152,25 @@ function sendCrashLoopAlertBestEffort(
   crashCount: number,
   errStr: string,
 ): boolean {
-  const creds = getOperatorChatCreds(frameworkRoot);
-  if (!creds) {
-    console.error('[daemon] Crash-loop alert: no operator chat configured ' +
-      '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
-    return false;
-  }
   const message =
     `🚨 CRITICAL: cortextos daemon is crash-looping\n` +
     `${crashCount} crashes in 15 minutes\n` +
     `Last error: ${errStr.slice(0, 500)}\n` +
     `Next alert in 30 min if the pattern continues.`;
+  return sendOperatorTelegramMessageBestEffort(frameworkRoot, message, 'Crash-loop alert');
+}
+
+function sendOperatorTelegramMessageBestEffort(
+  frameworkRoot: string,
+  message: string,
+  label: string,
+): boolean {
+  const creds = getOperatorChatCreds(frameworkRoot);
+  if (!creds) {
+    console.error(`[daemon] ${label}: no operator chat configured ` +
+      '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
+    return false;
+  }
   try {
     const r = spawnSync('curl', [
       '-s', '--max-time', '3',
@@ -172,14 +180,54 @@ function sendCrashLoopAlertBestEffort(
       '--data-urlencode', `text=${message}`,
     ], { timeout: TELEGRAM_SEND_TIMEOUT_MS, stdio: 'pipe', windowsHide: true });
     if (r.status === 0) {
-      console.error('[daemon] Crash-loop alert sent to operator chat');
+      console.error(`[daemon] ${label} sent to operator chat`);
       return true;
     }
-    console.error('[daemon] Crash-loop alert send failed (non-fatal)');
+    console.error(`[daemon] ${label} send failed (non-fatal)`);
     return false;
   } catch {
     return false;
   }
+}
+
+export function countPm2GodDaemons(): number {
+  const marker = /pm2[\\/]+lib[\\/]+Daemon\.js/i;
+  try {
+    const result = process.platform === 'win32'
+      ? spawnSync('powershell', [
+          '-NoProfile',
+          '-ExecutionPolicy', 'Bypass',
+          '-Command', 'Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine',
+        ], { encoding: 'utf-8', stdio: 'pipe', windowsHide: true, timeout: 3000 })
+      : spawnSync('ps', ['-eo', 'args='], { encoding: 'utf-8', stdio: 'pipe', timeout: 3000 });
+    if (result.status !== 0) return 0;
+    return String(result.stdout || '')
+      .split(/\r?\n/)
+      .filter(line => marker.test(line))
+      .length;
+  } catch {
+    return 0;
+  }
+}
+
+function warnOnDualPm2GodDaemon(frameworkRoot: string): void {
+  const count = countPm2GodDaemons();
+  if (count <= 1) return;
+  // Detection + operator alert ONLY — deliberately does NOT abort startup.
+  // Aborting here is actively harmful: in a genuine dual-God scenario BOTH
+  // cortextos-daemons run this check, both see count>1, and both exit(1) —
+  // taking the whole fleet down, which is the exact outage this work fixes.
+  // The IPC pipe handshake (probeSocketLive) already arbitrates a single safe
+  // owner at bind time, so we surface the anomaly loudly and continue.
+  // NOTE: count is system-wide (matches any pm2/lib/Daemon.js regardless of
+  // PM2_HOME) — a 2nd unrelated pm2 project will alert but no longer brick us.
+  // Follow-up: scope the match to our pinned PM2_HOME for precision.
+  const message =
+    `⚠️ cortextOS: ${count} PM2 God daemons detected (expected 1).\n` +
+    `If they share this PM2_HOME it risks split-brain supervision; the IPC ` +
+    `handshake will still bind a single owner. Investigate duplicate pm2 startup.`;
+  console.error(`[daemon] ${message.replace(/\n/g, ' ')}`);
+  sendOperatorTelegramMessageBestEffort(frameworkRoot, message, 'Dual PM2 God daemon alert');
 }
 
 /**
@@ -245,6 +293,8 @@ class Daemon {
       console.error('[daemon] CTX_FRAMEWORK_ROOT not set');
       process.exit(1);
     }
+
+    warnOnDualPm2GodDaemon(frameworkRoot);
 
     // Write PID file
     const pidFile = join(this.ctxRoot, 'daemon.pid');

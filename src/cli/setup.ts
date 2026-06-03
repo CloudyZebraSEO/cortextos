@@ -12,10 +12,13 @@ import { Command } from 'commander';
 import { createInterface, type Interface } from 'readline';
 import { existsSync, writeFileSync, chmodSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { homedir, platform } from 'os';
 import { spawnSync } from 'child_process';
 import { TelegramAPI, formatValidateError } from '../telegram/api.js';
 import { validateAgentName, validateOrgName } from '../utils/validate.js';
+
+const IS_WINDOWS = platform() === 'win32';
+const CANONICAL_PM2_HOME = 'C:\\Users\\steve\\.pm2';
 
 function rl(): Interface {
   return createInterface({ input: process.stdin, output: process.stdout });
@@ -411,7 +414,12 @@ export const setupCommand = new Command('setup')
     console.log('\n  ─────────────────────────────────────\n');
     console.log('  Step 5: Generating ecosystem config and starting daemon...\n');
 
-    const ecoEnv = { ...process.env, CTX_INSTANCE_ID: instanceId, CTX_ORG: orgName };
+    const ecoEnv = {
+      ...process.env,
+      ...(IS_WINDOWS ? { PM2_HOME: CANONICAL_PM2_HOME } : {}),
+      CTX_INSTANCE_ID: instanceId,
+      CTX_ORG: orgName,
+    };
     const ecoResult = spawnSync(process.execPath, [join(projectRoot, 'dist', 'cli.js'), 'ecosystem', '--instance', instanceId], {
       cwd: projectRoot,
       stdio: 'inherit',
@@ -425,9 +433,10 @@ export const setupCommand = new Command('setup')
       const pm2Result = spawnSync('pm2', ['start', 'ecosystem.config.js'], {
         cwd: projectRoot,
         stdio: 'inherit',
+        env: ecoEnv,
       });
       if (pm2Result.status === 0) {
-        spawnSync('pm2', ['save'], { cwd: projectRoot, stdio: 'inherit' });
+        spawnSync('pm2', ['save'], { cwd: projectRoot, stdio: 'inherit', env: ecoEnv });
         console.log('\n  Daemon started via PM2.');
       } else {
         // Fallback: cortextos start
