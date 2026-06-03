@@ -72,7 +72,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-idle-flag",
+            "command": "wscript.exe //B //nologo \"__CTX_VBS__\" \"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-idle-flag",
             "timeout": 5
           }
         ]
@@ -83,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" crash-alert",
+            "command": "wscript.exe //B //nologo \"__CTX_VBS__\" \"__CTX_NODE__\" \"__CTX_CLI__\" crash-alert",
             "timeout": 10
           }
         ]
@@ -94,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-compact-telegram",
+            "command": "wscript.exe //B //nologo \"__CTX_VBS__\" \"__CTX_NODE__\" \"__CTX_CLI__\" bus hook-compact-telegram",
             "timeout": 10
           }
         ]

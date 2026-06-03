@@ -418,12 +418,14 @@ function findTemplateDir(projectRoot: string, template: string): string | null {
 export function renderTemplateContent(content: string, name: string, org: string, nodePath = process.execPath, cliPath?: string): string {
   const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || process.cwd();
   const resolvedCliPath = cliPath || join(frameworkRoot, 'dist', 'cli.js');
+  const resolvedVbsPath = join(frameworkRoot, 'bin', 'run-hidden.vbs');
   return content
     .replace(/\{\{agent_name\}\}/g, name)
     .replace(/\{\{org\}\}/g, org)
     .replace(/\{\{current_timestamp\}\}/g, new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'))
     .replace(/__CTX_NODE__/g, nodePath.replace(/\\/g, '/'))
-    .replace(/__CTX_CLI__/g, resolvedCliPath.replace(/\\/g, '/'));
+    .replace(/__CTX_CLI__/g, resolvedCliPath.replace(/\\/g, '/'))
+    .replace(/__CTX_VBS__/g, resolvedVbsPath.replace(/\\/g, '/'));
 }
 
 function copyTemplateFiles(templateDir: string, agentDir: string, name: string, org: string): void {
