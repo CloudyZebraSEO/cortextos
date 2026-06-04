@@ -11,6 +11,7 @@ import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars } from '../utils/validate.js';
 import { writeContextStatusFromTranscript } from './context-writer.js';
+import { atomicWriteSync } from '../utils/atomic.js';
 
 type LogFn = (msg: string) => void;
 
@@ -940,7 +941,15 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     try {
       const raw = readFileSync(statusPath, 'utf-8');
       const data = JSON.parse(raw);
-      const age = now - new Date(data.written_at || 0).getTime();
+      const writtenAt = new Date(data.written_at || 0).getTime();
+      // Session-boundary guard: a status file written BEFORE the current session
+      // started is from a previous session (the file is not reset on a normal restart,
+      // and a force-restart's late-flushed value could carry an old high %). Ignore it
+      // until the new session's statusLine (or the daemon writer) refreshes it — this
+      // prevents a stale high % re-firing the handoff on a brand-new session.
+      const sessionStartMs = this.agent.getSessionStartTime();
+      if (sessionStartMs !== null && writtenAt < sessionStartMs) return;
+      const age = now - writtenAt;
       if (age > 10 * 60_000) return; // stale file — skip
       pct = typeof data.used_percentage === 'number' ? data.used_percentage : null;
       exceeds200k = Boolean(data.exceeds_200k_tokens);
@@ -1000,7 +1009,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       // Reset context_status.json so the new session doesn't re-trigger immediately
       const statusPath = join(this.paths.stateDir, 'context_status.json');
       try {
-        writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
+        atomicWriteSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
       } catch { /* non-fatal */ }
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
       const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. Then run: cortextos bus hard-restart --reason "context handoff at ${Math.round(effectivePct)}%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
@@ -1077,7 +1086,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // Tier 2 immediately by reading the stale high-% value from the previous session.
     const statusPath = join(this.paths.stateDir, 'context_status.json');
     try {
-      writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
+      atomicWriteSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
     } catch { /* non-fatal */ }
 
     // sessionRefresh() does stop() + start(); shouldContinue() will return false

@@ -37,8 +37,12 @@ import { atomicWriteSync } from '../utils/atomic.js';
 
 /** Only refresh when the existing statusLine value is at least this stale. */
 export const CTX_STALE_GATE_MS = 2 * 60_000;
-/** Bytes of the transcript tail to scan for the newest usage record. */
-const TAIL_BYTES = 64 * 1024;
+/** Backward scan: chunk size + HARD upper bound, so a pathological transcript can
+ *  never make the writer read unbounded. The newest assistant usage record can sit
+ *  arbitrarily far before EOF when a large tool_result line follows it — we scan
+ *  backward in chunks until we find it or hit SCAN_MAX_BYTES, then give up. */
+const SCAN_CHUNK_BYTES = 256 * 1024;
+const SCAN_MAX_BYTES = 4 * 1024 * 1024;
 
 export type CtxWriteResult =
   | 'written'
@@ -59,19 +63,28 @@ export function claudeProjectDir(launchDir: string): string {
 }
 
 /** Read up to the last `bytes` of a file without loading the whole thing. */
-function readTail(file: string, bytes: number): string {
-  const fd = openSync(file, 'r');
+/**
+ * Window occupancy from one JSONL line, or null if it is not an assistant usage record.
+ * Occupancy = input + cache_read + cache_creation + output. `cache_read` already folds
+ * in ALL prior turns' output (it became cached input); only the CURRENT turn's
+ * `output_tokens` is not yet reflected and IS present in the window going forward, so
+ * it is included (slightly conservative — biases the handoff to fire marginally early).
+ */
+function usageFromLine(ln: string): number | null {
+  if (!ln || ln.indexOf('"usage"') === -1) return null;
+  let o: any;
   try {
-    const size = fstatSync(fd).size;
-    const start = size > bytes ? size - bytes : 0;
-    const len = size - start;
-    if (len <= 0) return '';
-    const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, start);
-    return buf.toString('utf-8');
-  } finally {
-    closeSync(fd);
+    o = JSON.parse(ln);
+  } catch {
+    return null;
   }
+  const u = o && o.type === 'assistant' && o.message && o.message.usage;
+  if (!u) return null;
+  const input = typeof u.input_tokens === 'number' ? u.input_tokens : 0;
+  const cacheRead = typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : 0;
+  const cacheCreate = typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : 0;
+  const output = typeof u.output_tokens === 'number' ? u.output_tokens : 0;
+  return input + cacheRead + cacheCreate + output;
 }
 
 interface NewestTranscript {
@@ -92,43 +105,61 @@ function findNewestTranscript(projectDir: string): NewestTranscript | null {
     } catch {
       continue;
     }
-    if (!best || mtimeMs > best.mtimeMs) {
+    // Strictly-greater so iteration order never decides; on an exact mtime tie the
+    // lexically-greater filename wins (deterministic). Session-identity guards below
+    // are the real defense against an old file winning — this is just determinism.
+    if (!best || mtimeMs > best.mtimeMs || (mtimeMs === best.mtimeMs && f.slice(0, -'.jsonl'.length) > best.sessionId)) {
       best = { path: join(projectDir, f), sessionId: f.slice(0, -'.jsonl'.length), mtimeMs };
     }
   }
   return best;
 }
 
-/** Extract the newest assistant `message.usage` window-occupancy from a transcript tail. */
+/**
+ * Find the newest assistant usage occupancy by scanning the transcript BACKWARD in
+ * chunks. The newest usage record can sit far before EOF when a large tool_result line
+ * follows it (a 64KB fixed tail would miss it and silently fail during the exact long
+ * turn we are fixing). Bounded by SCAN_MAX_BYTES so a pathological file is never read
+ * unbounded. Lines straddling a chunk boundary are reassembled via `carry`.
+ */
 function newestUsageOccupancy(transcriptPath: string): number | null {
-  let tail: string;
+  let fd: number;
   try {
-    tail = readTail(transcriptPath, TAIL_BYTES);
+    fd = openSync(transcriptPath, 'r');
   } catch {
     return null;
   }
-  const lines = tail.split('\n');
-  // Walk from the end: the newest complete assistant usage line wins. A partial
-  // first line (tail cut mid-record) simply fails JSON.parse and is skipped.
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const ln = lines[i];
-    if (!ln || ln.indexOf('"usage"') === -1) continue;
-    let o: any;
-    try {
-      o = JSON.parse(ln);
-    } catch {
-      continue;
+  try {
+    const size = fstatSync(fd).size;
+    let pos = size;
+    let scanned = 0;
+    let carry = ''; // incomplete head of the chunk read just AFTER (later in file) this one
+    while (pos > 0 && scanned < SCAN_MAX_BYTES) {
+      const readLen = Math.min(SCAN_CHUNK_BYTES, pos);
+      pos -= readLen;
+      scanned += readLen;
+      const buf = Buffer.alloc(readLen);
+      readSync(fd, buf, 0, readLen, pos);
+      const text = buf.toString('utf-8') + carry;
+      const lines = text.split('\n');
+      // If we are not yet at the file start, this chunk's first line is incomplete
+      // (its head is in an earlier chunk) — defer it to the next (earlier) iteration.
+      carry = pos > 0 ? (lines.shift() ?? '') : '';
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const occ = usageFromLine(lines[i]);
+        if (occ !== null) return occ;
+      }
     }
-    const u = o && o.type === 'assistant' && o.message && o.message.usage;
-    if (!u) continue;
-    // Current-window occupancy = input + cache_read + cache_creation.
-    // `output_tokens` is THIS turn's generation, not cumulative window — excluded.
-    const input = typeof u.input_tokens === 'number' ? u.input_tokens : 0;
-    const cacheRead = typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : 0;
-    const cacheCreate = typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : 0;
-    return input + cacheRead + cacheCreate;
+    if (pos === 0) {
+      const occ = usageFromLine(carry);
+      if (occ !== null) return occ;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
   }
-  return null;
 }
 
 export interface CtxWriterOpts {
@@ -157,14 +188,14 @@ export function writeContextStatusFromTranscript(opts: CtxWriterOpts): CtxWriteR
     const newest = findNewestTranscript(projectDir);
     if (!newest) return 'skip-no-transcript';
 
-    // Current-session guard: a transcript older than this session's start is the
-    // PREVIOUS session (e.g. right after a force-restart, before the new jsonl exists).
-    // Acting on it would clobber the zero-reset and re-fire the handoff (restart loop).
+    // Guard 1 (mtime): a transcript not newer than this session's start is the PREVIOUS
+    // session (e.g. right after a force-restart, before the new jsonl exists). Acting on
+    // it would clobber the zero-reset and re-fire the handoff (restart loop).
     if (opts.sessionStartMs !== null && newest.mtimeMs <= opts.sessionStartMs) {
       return 'skip-prev-session';
     }
 
-    // Cap + staleness both come from the existing statusLine-written file.
+    // Cap + staleness + session identity all come from the existing statusLine file.
     const statusPath = join(opts.stateDir, 'context_status.json');
     if (!existsSync(statusPath)) return 'skip-no-cap'; // no cap source yet → never guess
     let existing: any;
@@ -174,9 +205,27 @@ export function writeContextStatusFromTranscript(opts: CtxWriterOpts): CtxWriteR
       return 'skip-no-cap';
     }
     const writtenAt = existing && existing.written_at ? new Date(existing.written_at).getTime() : 0;
+
+    // Guard 2 (written_at boundary): the status file itself predates this session — it is
+    // the pre-restart file; wait for the fresh statusLine rather than act on stale data.
+    // (mtime is race-prone if the old process flushes late; written_at is set atomically
+    //  by the restart reset, so it is a race-free session boundary.)
+    if (opts.sessionStartMs !== null && writtenAt < opts.sessionStartMs) {
+      return 'skip-prev-session';
+    }
+
     if (now - writtenAt < CTX_STALE_GATE_MS) {
       return 'skip-fresh-statusline'; // statusLine is fresh + authoritative (incl. cap)
     }
+
+    // Guard 3 (positive identity): once statusLine has recorded the live session_id, the
+    // transcript we picked MUST match it. Catches the racy case where an old session's
+    // jsonl is newest-by-mtime but statusLine has already advanced to the new session.
+    if (existing && typeof existing.session_id === 'string' && existing.session_id
+        && newest.sessionId !== existing.session_id) {
+      return 'skip-prev-session';
+    }
+
     const cap = typeof existing.context_window_size === 'number' && existing.context_window_size > 0
       ? existing.context_window_size
       : null;

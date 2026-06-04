@@ -64,14 +64,18 @@ function readStatus(): any {
 }
 
 const STALE = NOW - (CTX_STALE_GATE_MS + 60_000); // a comfortably-stale statusLine written_at
+// A long-running session started well before the stale statusLine write — so the status
+// file post-dates session start (statusLine fired early, then went stale). This is the
+// realistic shape; Guard 2 (written_at < sessionStart) only rejects PRE-session files.
+const SESSION_START = NOW - 3_600_000;
 
 describe('writeContextStatusFromTranscript', () => {
   // ── CRITICAL #1 — cap source ─────────────────────────────────────────────
   describe('CRITICAL #1: cap is sourced from statusLine, never guessed', () => {
     it('1M cap + 170k used → ~17% (does NOT cross a handoff threshold)', () => {
       writeStatus({ context_window_size: 1_000_000, written_at: new Date(STALE).toISOString() });
-      writeTranscript('sess-1m', { input_tokens: 0, cache_read_input_tokens: 170_000, cache_creation_input_tokens: 0, output_tokens: 9999 }, NOW - 5_000);
-      const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: NOW - 60_000, now: NOW });
+      writeTranscript('sess-1m', { input_tokens: 0, cache_read_input_tokens: 170_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000);
+      const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, now: NOW });
       expect(r).toBe('written');
       expect(readStatus().used_percentage).toBeCloseTo(17, 0);
     });
@@ -79,7 +83,7 @@ describe('writeContextStatusFromTranscript', () => {
     it('SAME 170k used + 200k cap → 85% (cap, not tokens, decides) ', () => {
       writeStatus({ context_window_size: 200_000, written_at: new Date(STALE).toISOString() });
       writeTranscript('sess-200k', { input_tokens: 0, cache_read_input_tokens: 170_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000);
-      const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: NOW - 60_000, now: NOW });
+      const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, now: NOW });
       expect(r).toBe('written');
       expect(readStatus().used_percentage).toBeCloseTo(85, 0);
     });
@@ -88,7 +92,7 @@ describe('writeContextStatusFromTranscript', () => {
       writeStatus({ written_at: new Date(STALE).toISOString() }); // no context_window_size
       writeTranscript('sess-x', { input_tokens: 0, cache_read_input_tokens: 170_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000);
       const before = readStatus();
-      const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: NOW - 60_000, now: NOW });
+      const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, now: NOW });
       expect(r).toBe('skip-no-cap');
       expect(readStatus()).toEqual(before); // untouched
     });
@@ -109,8 +113,9 @@ describe('writeContextStatusFromTranscript', () => {
     });
 
     it('new-session transcript (mtime > session start) → written with its filename session_id', () => {
-      writeStatus({ used_percentage: 0, context_window_size: 1_000_000, written_at: new Date(NOW - (CTX_STALE_GATE_MS + 1)).toISOString() });
-      const sessionStartMs = NOW - 30_000;
+      // New session started 5min ago; its statusLine fired (cap written) then went stale.
+      const sessionStartMs = NOW - 300_000;
+      writeStatus({ used_percentage: 0, context_window_size: 1_000_000, written_at: new Date(NOW - 180_000).toISOString() });
       writeTranscript('fresh-session', { input_tokens: 5, cache_read_input_tokens: 300_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000); // AFTER session start
       const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs, now: NOW });
       expect(r).toBe('written');
@@ -120,23 +125,64 @@ describe('writeContextStatusFromTranscript', () => {
     });
   });
 
+  // ── CRITICAL #3 — newest usage survives a large trailing tool_result ──────
+  describe('CRITICAL #3: bounded backward scan finds the newest usage past a huge trailing line', () => {
+    it('usage record >256KB before EOF (giant tool_result follows) is still found', () => {
+      writeStatus({ context_window_size: 1_000_000, written_at: new Date(STALE).toISOString() });
+      const p = join(projDir, 'big-sess.jsonl');
+      const usageLine = JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 0, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 0, output_tokens: 0 } } });
+      // A ~300KB user/tool_result line AFTER the usage record — a fixed 64KB (or 256KB)
+      // tail would never see the usage line. It contains no '"usage"' substring.
+      const giant = JSON.stringify({ type: 'user', message: { content: 'x'.repeat(300 * 1024) } });
+      writeFileSync(p, usageLine + '\n' + giant + '\n');
+      const secs = (NOW - 5_000) / 1000;
+      utimesSync(p, secs, secs);
+      const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, now: NOW });
+      expect(r).toBe('written');
+      expect(readStatus().used_percentage).toBeCloseTo(40, 0); // 400k / 1M — found despite the 300KB trailing line
+    });
+  });
+
+  // ── session-identity guards (post-restart hardening) ──────────────────────
+  it('Guard 2: status file written BEFORE session start → skip-prev-session (racy late-flush / normal restart)', () => {
+    const sessionStartMs = NOW - 30_000;
+    writeStatus({ used_percentage: 90, context_window_size: 1_000_000, session_id: 'old', written_at: new Date(sessionStartMs - 60_000).toISOString() });
+    // transcript mtime is AFTER session start (the old process flushed late) → passes the
+    // mtime guard, but Guard 2 rejects it because the status file predates the session.
+    writeTranscript('old', { input_tokens: 0, cache_read_input_tokens: 900_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000);
+    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs, now: NOW });
+    expect(r).toBe('skip-prev-session');
+    expect(readStatus().used_percentage).toBe(90); // untouched
+  });
+
+  it('Guard 3: transcript session_id != live statusLine session_id → skip-prev-session', () => {
+    const sessionStartMs = NOW - 600_000;
+    writeStatus({ used_percentage: 50, context_window_size: 1_000_000, session_id: 'live-sess', written_at: new Date(NOW - 300_000).toISOString() });
+    // newest-by-mtime transcript is a DIFFERENT (stale) session than the one statusLine
+    // has recorded — the racy "old file is newest" case. Positive identity rejects it.
+    writeTranscript('stale-other-sess', { input_tokens: 0, cache_read_input_tokens: 950_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000);
+    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs, now: NOW });
+    expect(r).toBe('skip-prev-session');
+    expect(readStatus().used_percentage).toBe(50); // 95% mismatched-session transcript did NOT clobber it
+  });
+
   // ── stale gate ───────────────────────────────────────────────────────────
   it('statusLine fresh (age < 2min) → skip-fresh-statusline (statusLine authoritative)', () => {
     writeStatus({ used_percentage: 40, context_window_size: 1_000_000, written_at: new Date(NOW - 30_000).toISOString() });
     writeTranscript('sess', { input_tokens: 0, cache_read_input_tokens: 800_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000);
-    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: NOW - 60_000, now: NOW });
+    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, now: NOW });
     expect(r).toBe('skip-fresh-statusline');
     expect(readStatus().used_percentage).toBe(40); // not overwritten
   });
 
   // ── token formula ────────────────────────────────────────────────────────
-  it('token formula = input + cache_read + cache_creation (output_tokens EXCLUDED)', () => {
+  it('token formula = input + cache_read + cache_creation + output (output INCLUDED)', () => {
     writeStatus({ context_window_size: 1_000_000, written_at: new Date(STALE).toISOString() });
     writeTranscript('sess', { input_tokens: 10_000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 40_000, output_tokens: 500_000 }, NOW - 5_000);
-    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: NOW - 60_000, now: NOW });
+    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, now: NOW });
     expect(r).toBe('written');
-    // (10k + 100k + 40k) / 1M = 15%, NOT (… + 500k) = 65%
-    expect(readStatus().used_percentage).toBeCloseTo(15, 0);
+    // (10k + 100k + 40k + 500k) / 1M = 65% — output IS counted (it is in the window next turn)
+    expect(readStatus().used_percentage).toBeCloseTo(65, 0);
   });
 
   // ── robustness ───────────────────────────────────────────────────────────
@@ -152,7 +198,7 @@ describe('writeContextStatusFromTranscript', () => {
     writeFileSync(p, '{not json\n{"type":"user","message":{}}\n');
     const secs = (NOW - 5_000) / 1000;
     utimesSync(p, secs, secs);
-    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: NOW - 60_000, now: NOW });
+    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, now: NOW });
     expect(r).toBe('skip-no-usage');
   });
 });
