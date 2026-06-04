@@ -1,7 +1,7 @@
-import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
-import { join, sep } from 'path';
-import { homedir } from 'os';
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
+import { claudeProjectDir } from './context-writer.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
@@ -421,6 +421,15 @@ export class AgentProcess {
   }
 
   /**
+   * Start time (ms) of the CURRENT session, reset on every start()/sessionRefresh().
+   * Used by the daemon-side context writer to reject a previous session's transcript
+   * after a force-restart. Null before the first session has started.
+   */
+  getSessionStartTime(): number | null {
+    return this.sessionStart ? this.sessionStart.getTime() : null;
+  }
+
+  /**
    * Get the current agent config (live reference — fields may be updated in-place).
    */
   getConfig(): AgentConfig {
@@ -677,18 +686,13 @@ export class AgentProcess {
     const launchDir = this.config.working_directory || this.env.agentDir;
     if (!launchDir) return false;
 
-    // Claude projects dir uses the absolute path with all separators replaced by dashes
-    // e.g. /Users/foo/agents/boss -> -Users-foo-agents-boss (leading sep becomes -)
-    // Use homedir() for cross-platform compatibility (HOME is not set on Windows).
-    const convDir = join(
-      homedir(),
-      '.claude',
-      'projects',
-      launchDir.split(sep).join('-'),
-    );
+    // Claude Code's projects dir = launch cwd with every non-alphanumeric char replaced
+    // by '-' (e.g. C:\Users\…\boss -> C--Users-…-boss). claudeProjectDir handles the
+    // Windows colon-replacement that a naive split(sep).join('-') gets wrong (C:-Users-…).
+    const convDir = claudeProjectDir(launchDir);
 
     try {
-      const files = require('fs').readdirSync(convDir);
+      const files = readdirSync(convDir);
       return files.some((f: string) => f.endsWith('.jsonl'));
     } catch {
       return false;

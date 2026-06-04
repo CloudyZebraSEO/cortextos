@@ -10,6 +10,7 @@ import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars } from '../utils/validate.js';
+import { writeContextStatusFromTranscript } from './context-writer.js';
 
 type LogFn = (msg: string) => void;
 
@@ -915,7 +916,22 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     }
 
-    // Read the bridge file written by hook-context-status
+    // Phase-2: refresh context_status.json from the live Claude transcript if the
+    // statusLine hook has gone stale (long heads-down turn). No-op when statusLine is
+    // fresh, the cap is unknown, or the newest transcript is a previous session. codex
+    // agents write context_status.json via their own PTY bridge — skip them here.
+    const runtime = this.agent.getConfig().runtime;
+    if (runtime !== 'codex-app-server' && runtime !== 'hermes') {
+      writeContextStatusFromTranscript({
+        launchDir: this.agent.getConfig().working_directory || this.agent.getAgentDir(),
+        stateDir: this.paths.stateDir,
+        sessionStartMs: this.agent.getSessionStartTime(),
+        log: (m) => this.log(m),
+      });
+    }
+
+    // Read the bridge file written by hook-context-status (or, when stale, by the
+    // daemon-side transcript writer above)
     const statusPath = join(this.paths.stateDir, 'context_status.json');
     if (!existsSync(statusPath)) return;
 
@@ -1048,6 +1064,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ctxHandoffFiredAt = 0;
     this.ctxHandoffDeadlineAt = 0;
     this.ctxWarningFiredAt = 0;
+    // Clear the last-seen session id so the NEXT session_id is always treated as a
+    // fresh boundary. Without this, a stale-high value carrying the same session_id
+    // could slip past the consumer's session-reset guard and re-fire the handoff
+    // immediately on the fresh session (the post-restart restart-loop).
+    this.ctxLastSessionId = null;
 
     // Write .force-fresh + .restart-planned (hardRestart from src/bus/system.ts)
     hardRestart(this.paths, this.agent.name, `CONTEXT-FORCE-RESTART: ${reason}`);
