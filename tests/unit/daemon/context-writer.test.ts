@@ -166,6 +166,14 @@ describe('writeContextStatusFromTranscript', () => {
     expect(readStatus().used_percentage).toBe(50); // 95% mismatched-session transcript did NOT clobber it
   });
 
+  it('Guard 0: blockedSessionId == newest transcript session → skip-prev-session (late-flush block)', () => {
+    writeStatus({ used_percentage: 50, context_window_size: 1_000_000, session_id: 'dying', written_at: new Date(STALE).toISOString() });
+    writeTranscript('dying', { input_tokens: 0, cache_read_input_tokens: 950_000, cache_creation_input_tokens: 0, output_tokens: 0 }, NOW - 5_000);
+    const r = writeContextStatusFromTranscript({ launchDir: 'x', stateDir, transcriptDir: projDir, sessionStartMs: SESSION_START, blockedSessionId: 'dying', now: NOW });
+    expect(r).toBe('skip-prev-session');
+    expect(readStatus().used_percentage).toBe(50); // the torn-down session's 95% did NOT get written
+  });
+
   // ── stale gate ───────────────────────────────────────────────────────────
   it('statusLine fresh (age < 2min) → skip-fresh-statusline (statusLine authoritative)', () => {
     writeStatus({ used_percentage: 40, context_window_size: 1_000_000, written_at: new Date(NOW - 30_000).toISOString() });

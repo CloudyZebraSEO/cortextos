@@ -56,6 +56,7 @@ export class FastChecker {
   private ctxHandoffFiredAt: number = 0;    // fires once per session (0 = not yet)
   private ctxHandoffDeadlineAt: number = 0; // timestamp after which force-restart fires
   private ctxLastSessionId: string | null = null; // detects new session → clears stale deadline
+  private ctxBlockedSessionId: string | null = null; // session torn down by force-restart → reject its (possibly late-flushed) values until a different session appears
   private ctxCircuitRestarts: number[] = []; // timestamps of recent context-triggered restarts
   private ctxCircuitBrokenAt: number | null = null; // when circuit tripped (null = healthy)
   // Persisted to disk so --continue restarts don't reset the circuit breaker
@@ -927,6 +928,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         launchDir: this.agent.getConfig().working_directory || this.agent.getAgentDir(),
         stateDir: this.paths.stateDir,
         sessionStartMs: this.agent.getSessionStartTime(),
+        blockedSessionId: this.ctxBlockedSessionId,
         log: (m) => this.log(m),
       });
     }
@@ -951,13 +953,23 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       if (sessionStartMs !== null && writtenAt < sessionStartMs) return;
       const age = now - writtenAt;
       if (age > 10 * 60_000) return; // stale file — skip
+
+      // Positive session-identity guard: reject a value carrying the session_id that a
+      // force-restart just tore down — even if it is fresh and post-dates sessionStart
+      // (a late statusLine flush from the dying old session). A genuinely-new session_id
+      // clears the block. Without this, an old high % could re-fire the handoff on the
+      // brand-new session (the restart loop).
+      const dataSessionId = typeof data.session_id === 'string' ? data.session_id : null;
+      if (this.ctxBlockedSessionId !== null && dataSessionId === this.ctxBlockedSessionId) return;
+      if (dataSessionId && dataSessionId !== this.ctxBlockedSessionId) this.ctxBlockedSessionId = null;
+
       pct = typeof data.used_percentage === 'number' ? data.used_percentage : null;
       exceeds200k = Boolean(data.exceeds_200k_tokens);
 
       // Detect new session: if session_id changed, clear stale per-session ctx state.
       // This handles the case where the agent self-restarts (voluntary handoff) and the
       // 5-min deadline timer would otherwise fire on the fresh low-context session.
-      const incomingSessionId = typeof data.session_id === 'string' ? data.session_id : null;
+      const incomingSessionId = dataSessionId;
       if (incomingSessionId && incomingSessionId !== this.ctxLastSessionId) {
         if (this.ctxLastSessionId !== null) {
           this.ctxHandoffFiredAt = 0;
@@ -1073,10 +1085,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ctxHandoffFiredAt = 0;
     this.ctxHandoffDeadlineAt = 0;
     this.ctxWarningFiredAt = 0;
-    // Clear the last-seen session id so the NEXT session_id is always treated as a
-    // fresh boundary. Without this, a stale-high value carrying the same session_id
-    // could slip past the consumer's session-reset guard and re-fire the handoff
-    // immediately on the fresh session (the post-restart restart-loop).
+    // BLOCK the dying session's id (the one the consumer last saw) so any late-flushed
+    // value carrying it — fresh or not, before the new session's statusLine fires — is
+    // rejected by the consumer + writer until a genuinely-new session_id appears. This
+    // closes the post-restart restart-loop that clearing ctxLastSessionId alone left
+    // open (a late old-session flush would otherwise be trusted as "first seen").
+    if (this.ctxLastSessionId !== null) this.ctxBlockedSessionId = this.ctxLastSessionId;
     this.ctxLastSessionId = null;
 
     // Write .force-fresh + .restart-planned (hardRestart from src/bus/system.ts)

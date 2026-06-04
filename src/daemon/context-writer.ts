@@ -150,9 +150,13 @@ function newestUsageOccupancy(transcriptPath: string): number | null {
         if (occ !== null) return occ;
       }
     }
-    // When pos reaches 0, carry is set to "" and line 0 was already scanned in-loop;
-    // when the loop exits on the SCAN_MAX_BYTES budget, the remaining head is correctly
-    // discarded. So there is nothing left to check here.
+    // Check the final carry. When pos reached 0 this is "" (harmless). When the loop
+    // exited on the SCAN_MAX_BYTES budget, carry holds the first (oldest) line of the
+    // last chunk — which IS a complete usage record if that line happened to start at
+    // the chunk boundary; usageFromLine returns null for an incomplete/partial line, so
+    // this is safe in every case and recovers the exact-boundary record.
+    const occ = usageFromLine(carry);
+    if (occ !== null) return occ;
     return null;
   } catch {
     return null;
@@ -172,6 +176,8 @@ export interface CtxWriterOpts {
   now?: number;
   /** Test seam: override the resolved Claude projects dir (default = claudeProjectDir(launchDir)). */
   transcriptDir?: string;
+  /** Session id torn down by a force-restart — its transcript must never be written. */
+  blockedSessionId?: string | null;
   log?: (msg: string) => void;
 }
 
@@ -186,6 +192,12 @@ export function writeContextStatusFromTranscript(opts: CtxWriterOpts): CtxWriteR
     const projectDir = opts.transcriptDir ?? claudeProjectDir(opts.launchDir);
     const newest = findNewestTranscript(projectDir);
     if (!newest) return 'skip-no-transcript';
+
+    // Guard 0 (blocked session): never write from the transcript of a session that a
+    // force-restart just tore down, even if its file is newest/late-flushed.
+    if (opts.blockedSessionId && newest.sessionId === opts.blockedSessionId) {
+      return 'skip-prev-session';
+    }
 
     // Guard 1 (mtime): a transcript not newer than this session's start is the PREVIOUS
     // session (e.g. right after a force-restart, before the new jsonl exists). Acting on
