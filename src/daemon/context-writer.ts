@@ -150,10 +150,9 @@ function newestUsageOccupancy(transcriptPath: string): number | null {
         if (occ !== null) return occ;
       }
     }
-    if (pos === 0) {
-      const occ = usageFromLine(carry);
-      if (occ !== null) return occ;
-    }
+    // When pos reaches 0, carry is set to "" and line 0 was already scanned in-loop;
+    // when the loop exits on the SCAN_MAX_BYTES budget, the remaining head is correctly
+    // discarded. So there is nothing left to check here.
     return null;
   } catch {
     return null;
