@@ -2,7 +2,7 @@ import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
+import { sendMessage, checkInbox, ackInbox, checkInboxHealth } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
@@ -568,6 +568,18 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const report = checkStaleTasks(paths);
     console.log(JSON.stringify(report));
+  });
+
+busCommand
+  .command('check-inbox-health')
+  .description('Report inbox depth + lock state per agent (detect wedged/stuck inboxes)')
+  .option('--all-agents', 'scan every agent (default: this agent only)')
+  .action((opts: { allAgents?: boolean }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const rows = checkInboxHealth(paths.ctxRoot, { agent: opts.allAgents ? undefined : env.agentName });
+    const warnings = rows.filter(r => r.warnings.length > 0);
+    console.log(JSON.stringify({ checked: rows.length, warnings: warnings.length, rows }, null, 2));
   });
 
 busCommand
