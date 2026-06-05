@@ -10,6 +10,8 @@ import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars } from '../utils/validate.js';
+import { writeContextStatusFromTranscript } from './context-writer.js';
+import { atomicWriteSync } from '../utils/atomic.js';
 
 type LogFn = (msg: string) => void;
 
@@ -54,6 +56,7 @@ export class FastChecker {
   private ctxHandoffFiredAt: number = 0;    // fires once per session (0 = not yet)
   private ctxHandoffDeadlineAt: number = 0; // timestamp after which force-restart fires
   private ctxLastSessionId: string | null = null; // detects new session → clears stale deadline
+  private ctxBlockedSessionId: string | null = null; // session torn down by force-restart → reject its (possibly late-flushed) values until a different session appears
   private ctxCircuitRestarts: number[] = []; // timestamps of recent context-triggered restarts
   private ctxCircuitBrokenAt: number | null = null; // when circuit tripped (null = healthy)
   // Persisted to disk so --continue restarts don't reset the circuit breaker
@@ -915,7 +918,23 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     }
 
-    // Read the bridge file written by hook-context-status
+    // Phase-2: refresh context_status.json from the live Claude transcript if the
+    // statusLine hook has gone stale (long heads-down turn). No-op when statusLine is
+    // fresh, the cap is unknown, or the newest transcript is a previous session. codex
+    // agents write context_status.json via their own PTY bridge — skip them here.
+    const runtime = this.agent.getConfig().runtime;
+    if (runtime !== 'codex-app-server' && runtime !== 'hermes') {
+      writeContextStatusFromTranscript({
+        launchDir: this.agent.getConfig().working_directory || this.agent.getAgentDir(),
+        stateDir: this.paths.stateDir,
+        sessionStartMs: this.agent.getSessionStartTime(),
+        blockedSessionId: this.ctxBlockedSessionId,
+        log: (m) => this.log(m),
+      });
+    }
+
+    // Read the bridge file written by hook-context-status (or, when stale, by the
+    // daemon-side transcript writer above)
     const statusPath = join(this.paths.stateDir, 'context_status.json');
     if (!existsSync(statusPath)) return;
 
@@ -924,15 +943,33 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     try {
       const raw = readFileSync(statusPath, 'utf-8');
       const data = JSON.parse(raw);
-      const age = now - new Date(data.written_at || 0).getTime();
+      const writtenAt = new Date(data.written_at || 0).getTime();
+      // Session-boundary guard: a status file written BEFORE the current session
+      // started is from a previous session (the file is not reset on a normal restart,
+      // and a force-restart's late-flushed value could carry an old high %). Ignore it
+      // until the new session's statusLine (or the daemon writer) refreshes it — this
+      // prevents a stale high % re-firing the handoff on a brand-new session.
+      const sessionStartMs = this.agent.getSessionStartTime();
+      if (sessionStartMs !== null && writtenAt < sessionStartMs) return;
+      const age = now - writtenAt;
       if (age > 10 * 60_000) return; // stale file — skip
+
+      // Positive session-identity guard: reject a value carrying the session_id that a
+      // force-restart just tore down — even if it is fresh and post-dates sessionStart
+      // (a late statusLine flush from the dying old session). A genuinely-new session_id
+      // clears the block. Without this, an old high % could re-fire the handoff on the
+      // brand-new session (the restart loop).
+      const dataSessionId = typeof data.session_id === 'string' ? data.session_id : null;
+      if (this.ctxBlockedSessionId !== null && dataSessionId === this.ctxBlockedSessionId) return;
+      if (dataSessionId && dataSessionId !== this.ctxBlockedSessionId) this.ctxBlockedSessionId = null;
+
       pct = typeof data.used_percentage === 'number' ? data.used_percentage : null;
       exceeds200k = Boolean(data.exceeds_200k_tokens);
 
       // Detect new session: if session_id changed, clear stale per-session ctx state.
       // This handles the case where the agent self-restarts (voluntary handoff) and the
       // 5-min deadline timer would otherwise fire on the fresh low-context session.
-      const incomingSessionId = typeof data.session_id === 'string' ? data.session_id : null;
+      const incomingSessionId = dataSessionId;
       if (incomingSessionId && incomingSessionId !== this.ctxLastSessionId) {
         if (this.ctxLastSessionId !== null) {
           this.ctxHandoffFiredAt = 0;
@@ -984,7 +1021,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       // Reset context_status.json so the new session doesn't re-trigger immediately
       const statusPath = join(this.paths.stateDir, 'context_status.json');
       try {
-        writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
+        atomicWriteSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
       } catch { /* non-fatal */ }
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
       const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. Then run: cortextos bus hard-restart --reason "context handoff at ${Math.round(effectivePct)}%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
@@ -1048,6 +1085,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ctxHandoffFiredAt = 0;
     this.ctxHandoffDeadlineAt = 0;
     this.ctxWarningFiredAt = 0;
+    // BLOCK the dying session's id (the one the consumer last saw) so any late-flushed
+    // value carrying it — fresh or not, before the new session's statusLine fires — is
+    // rejected by the consumer + writer until a genuinely-new session_id appears. This
+    // closes the post-restart restart-loop that clearing ctxLastSessionId alone left
+    // open (a late old-session flush would otherwise be trusted as "first seen").
+    if (this.ctxLastSessionId !== null) this.ctxBlockedSessionId = this.ctxLastSessionId;
+    this.ctxLastSessionId = null;
 
     // Write .force-fresh + .restart-planned (hardRestart from src/bus/system.ts)
     hardRestart(this.paths, this.agent.name, `CONTEXT-FORCE-RESTART: ${reason}`);
@@ -1056,7 +1100,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // Tier 2 immediately by reading the stale high-% value from the previous session.
     const statusPath = join(this.paths.stateDir, 'context_status.json');
     try {
-      writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
+      atomicWriteSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
     } catch { /* non-fatal */ }
 
     // sessionRefresh() does stop() + start(); shouldContinue() will return false
