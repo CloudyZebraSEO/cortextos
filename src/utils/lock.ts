@@ -1,79 +1,112 @@
-import { mkdirSync, rmdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
+import { writeFileSync, readFileSync, rmSync, linkSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 
 /**
- * Acquire a mutex lock using mkdir (atomic on all filesystems).
- * Matches the bash pattern: mkdir .lock.d with PID tracking.
+ * Acquire a mutex lock via an ATOMIC, windowless file create.
  *
- * Returns true if lock acquired, false if another process holds it.
- * Automatically recovers stale locks (dead process).
+ * The lock is a regular file (`.lock`) whose content is the owner pid. It is
+ * created by hard-linking a fully-written temp file into place: `linkSync` is
+ * atomic and fails EEXIST if the lock already exists, and the lock file springs
+ * into existence ALREADY containing the pid (it is a hardlink to the complete
+ * temp). There is therefore NO instant at which `.lock` exists without its owner
+ * pid — the pid-less window that permanently deadlocked the old mkdir+write
+ * mutex (a crash between `mkdir` and `writeFile(pid)` left a lock nothing could
+ * steal — it deafened codex's inbox for 3 days) is eliminated by construction.
+ *
+ * (A lighter single-op variant — `writeFileSync(lock, pid, {flag:'wx'})` — also
+ * fixes the deadlock but reintroduces a microscopic open→write window where an
+ * empty lock can be stolen mid-acquire; the hardlink-temp approach here is
+ * windowless and was chosen for the strongest guarantee on this critical
+ * primitive. Full-suite perf is identical: parallel-load flakiness is the same
+ * for both and absent single-threaded — the extra temp op is not a factor.)
+ *
+ * Stale recovery: a holder that crashed WHILE holding the lock leaves `.lock`
+ * with a dead pid; we detect that (`process.kill(pid,0)` throws) and remove it
+ * so the next attempt re-links. NOTE: this recovery is not identity-safe under
+ * two concurrent recoverers — the SAME pre-existing race the mkdir version had
+ * (`rmSync` could nuke a peer's freshly-recovered lock). Locks are held for
+ * microseconds and recovery is rare; the serialized-recovery hardening is a
+ * separate fast-follow (and, when built, its recovery mutex must itself use this
+ * atomic primitive — never a bare mkdir, which would re-introduce the deadlock).
+ *
+ * Returns true if acquired, false if another LIVE process holds it (caller retries).
+ * Real filesystem failures (EACCES/ENOSPC/EROFS/ENOENT…) propagate so callers do
+ * not spin against a path that will never be writable.
  */
 export function acquireLock(dir: string): boolean {
-  const lockDir = join(dir, '.lock.d');
-  const pidFile = join(lockDir, 'pid');
+  const lockFile = join(dir, '.lock');
+  // randomUUID guarantees a unique temp name per attempt even across same-PID
+  // worker threads / isolates (where a module-level counter would each reset);
+  // 'wx' refuses to clobber any (astronomically unlikely) name collision.
+  const tmpFile = join(dir, `.lock.${process.pid}.${randomUUID()}.tmp`);
+
+  // Write the owner pid to a private temp FIRST. A real fs error here propagates.
+  writeFileSync(tmpFile, String(process.pid), { flag: 'wx' });
 
   try {
-    mkdirSync(lockDir);
-    writeFileSync(pidFile, String(process.pid));
+    // Atomically publish the lock: the hardlink either creates `.lock` (already
+    // holding the pid) or fails EEXIST if it is held. No pid-less window exists.
+    linkSync(tmpFile, lockFile);
     return true;
   } catch (err) {
-    // Only EEXIST means contention. EACCES / ENOSPC / EROFS / etc. are real
-    // filesystem failures — propagate so the caller (withFileLockSync) does
-    // not loop forever against a directory that will never be writable.
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'EEXIST') {
-      throw err;
+      throw err; // real filesystem failure — propagate
     }
-    // mkdirSync failed with EEXIST — another process holds (or is mid-acquire
-    // of) the lock.  We must NOT treat the gap between mkdirSync and
-    // writeFileSync as "stale" — doing so allows two acquirers to interleave
-    // and BOTH believe they hold the lock (the actual race that broke iter
-    // 12).  When the PID file is missing, the holder is mid-acquire; the
-    // caller should retry.
-    let storedPidRaw: string;
+    // Lock is held. Read the always-present owner pid; recover only if dead.
+    let alive = true;
     try {
-      storedPidRaw = readFileSync(pidFile, 'utf-8').trim();
-    } catch {
-      // PID file not yet written.  Holder is between mkdir and writeFileSync.
-      // Refuse the lock — the caller's retry loop will try again.
-      return false;
-    }
-
-    const storedPid = parseInt(storedPidRaw, 10);
-    if (isNaN(storedPid) || storedPidRaw === '') {
-      // Corrupt PID file.  Don't steal — let caller retry; if it persists
-      // the holder is broken and a future stale-detection pass (process.kill
-      // check below, after the PID is written cleanly) will recover.
-      return false;
-    }
-
-    // Check if process is still alive
-    try {
-      process.kill(storedPid, 0);
-      // Process is alive - lock is held
-      return false;
-    } catch {
-      // Process is dead - stale lock, remove and re-acquire atomically.
-      try {
-        rmSync(lockDir, { recursive: true, force: true });
-        mkdirSync(lockDir);
-        writeFileSync(pidFile, String(process.pid));
-        return true;
-      } catch {
-        // Another process beat us to the steal — let caller retry.
-        return false;
+      const raw = readFileSync(lockFile, 'utf-8').trim();
+      if (raw === '') {
+        alive = false; // empty (legacy/partial) — recoverable
+      } else {
+        const pid = parseInt(raw, 10);
+        if (Number.isNaN(pid)) {
+          alive = false; // corrupt content — recoverable
+        } else {
+          try {
+            process.kill(pid, 0);
+          } catch {
+            alive = false; // holder process is dead — recoverable
+          }
+        }
       }
+    } catch {
+      // `.lock` vanished between EEXIST and read (released concurrently) — the
+      // caller's retry will re-link cleanly.
+      return false;
+    }
+    if (alive) {
+      return false; // held by a live process — caller retries
+    }
+    // Dead/corrupt holder: remove so the next attempt re-links. `rmSync(force)`
+    // never throws on ENOENT, so a concurrent recoverer winning is harmless.
+    try {
+      rmSync(lockFile, { force: true });
+    } catch {
+      /* another recoverer won — fine */
+    }
+    return false; // let the caller's retry loop re-link
+  } finally {
+    // Drop our temp name. After a successful link the lock survives (it is a
+    // separate hardlink to the same inode); on EEXIST/failure this removes the
+    // orphan temp.
+    try {
+      unlinkSync(tmpFile);
+    } catch {
+      /* already gone */
     }
   }
 }
 
 /**
- * Release a mutex lock.
+ * Release a mutex lock (remove the `.lock` file).
  */
 export function releaseLock(dir: string): void {
-  const lockDir = join(dir, '.lock.d');
+  const lockFile = join(dir, '.lock');
   try {
-    rmSync(lockDir, { recursive: true, force: true });
+    rmSync(lockFile, { force: true });
   } catch {
     // Ignore errors on release
   }
