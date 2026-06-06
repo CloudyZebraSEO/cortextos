@@ -13,6 +13,8 @@ Read this file on every session start. Full reference: `.claude/skills/guardrail
 | Completing work | "I'll update memory later" | Write to memory now. Later means never. Context you don't write down is context the next session loses. |
 | Inbox check | "I'll check messages after I finish this" | Process inbox now. Un-ACK'd messages redeliver and block other agents. |
 | Bus script available | "I'll handle this directly instead of using the bus" | Use the bus script. Work that doesn't go through the bus is invisible to the system. |
+| Adding a memory/vector backend | "I'll wire in a second KB provider for this" | Single external memory provider only (ChromaDB + Gemini embeddings). A second provider bloats tool schemas and splits institutional memory. Route everything through the existing `kb-*` bus commands. |
+| MEMORY.md past 200 lines | "I'll keep appending, it's all useful" | MEMORY.md is a capped index (≤200 lines), not a log. Move oldest detail to a topic file, leave a one-line pointer. |
 
 ## Specialist Agent Patterns
 

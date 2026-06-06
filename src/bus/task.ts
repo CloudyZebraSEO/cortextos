@@ -270,11 +270,13 @@ export function updateTask(
   }
   let prevStatus: TaskStatus | undefined;
   let assignee: string | undefined;
+  let taskOrg = '';
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
     assignee = task.assigned_to;
+    taskOrg = task.org || '';
     task.status = status;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
@@ -282,6 +284,18 @@ export function updateTask(
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
   appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+
+  // Trajectory: record the OTHER terminal outcome here (completion is logged
+  // by completeTask). Without this, the behavioral-analytics rollup would have
+  // survivorship bias — only successes, never abandoned/cancelled work. Guard
+  // on a real transition INTO 'cancelled' so re-cancelling is not double-logged.
+  // Best-effort, nothing here may throw past the persisted status change.
+  if (assignee && status === 'cancelled' && prevStatus !== 'cancelled') {
+    appendTrajectory(analyticsPathsForTask(paths, filePath), assignee, taskOrg, {
+      task_id: taskId,
+      outcome: 'cancelled',
+    });
+  }
 }
 
 /**
@@ -441,16 +455,71 @@ export function claimTask(
 }
 
 /**
+ * Append a structured trajectory entry for a completed task. This is the
+ * machine-readable behavioral trace the orchestrator's analytics rollup
+ * consumes (one JSONL line per task completion), complementing the prose
+ * daily-memory log. Stored alongside events under the analytics tree:
+ *   {analyticsDir}/trajectory/{agent}/trajectory.jsonl
+ *
+ * Minimal schema for now — {task_id, agent, org, outcome, ts}. Enrich with
+ * tools_used / duration later when those are cheaply available; keeping the
+ * line self-describing (agent + org) means a cross-agent rollup needs no
+ * out-of-band context. Best-effort: a failing trajectory write never blocks
+ * task completion or the activity-feed event.
+ */
+function appendTrajectory(
+  paths: BusPaths,
+  agent: string,
+  org: string,
+  entry: { task_id: string; outcome: string },
+): void {
+  try {
+    const dir = join(paths.analyticsDir, 'trajectory', agent);
+    ensureDir(dir);
+    // Full ISO precision (incl. milliseconds) — unlike the activity-feed event
+    // and audit timestamps (which strip ms for display), the trajectory log is
+    // machine-consumed by a cross-agent analytics rollup that needs sub-second
+    // ordering when several tasks finish in the same second.
+    const ts = new Date().toISOString();
+    const line = JSON.stringify({
+      task_id: entry.task_id,
+      agent,
+      org,
+      outcome: entry.outcome,
+      ts,
+    });
+    appendFileSync(join(dir, 'trajectory.jsonl'), line + '\n', 'utf-8');
+  } catch {
+    // Never let trajectory logging break task completion.
+  }
+}
+
+/**
+ * Resolve the analytics paths for a task's OWN org. Cross-org operations
+ * (caller's org ≠ task's org, allowed via findTaskFile) must write
+ * observability under the task's org tree, not the caller's. Returns `paths`
+ * unchanged for flat/single-org layouts (test harnesses) where the resolved
+ * task path is not in the nested <ctxRoot>/orgs/<org>/tasks/ form.
+ */
+function analyticsPathsForTask(paths: BusPaths, filePath: string): BusPaths {
+  const pathOrgMatch = filePath.match(/[\\/]orgs[\\/](?<org>[^\\/]+)[\\/]tasks[\\/]/);
+  const fileOrg = pathOrgMatch?.groups?.org || '';
+  return fileOrg
+    ? { ...paths, analyticsDir: join(paths.ctxRoot, 'orgs', fileOrg, 'analytics') }
+    : paths;
+}
+
+/**
  * Complete a task. Sets status to done, completed_at, and optional result.
  * Matches bash complete-task.sh behavior, with the cross-org fallback from
  * findTaskFile so an assignee in one org can complete a task filed by an
  * orchestrator in a sibling org.
  *
- * Side-effect: emits a `task/task_completed` event on the activity feed so
- * completions are visible on the dashboard without agents having to follow
- * every complete-task call with a separate log-event. The event is written
- * best-effort — a failing event write never unblocks task completion from
- * persisting to disk.
+ * Side-effects (both best-effort — neither blocks the task persisting to disk):
+ * 1. emits a `task/task_completed` event on the activity feed so completions
+ *    are visible on the dashboard without a separate log-event call;
+ * 2. appends a structured trajectory entry (see appendTrajectory) for the
+ *    orchestrator's behavioral-analytics rollup.
  */
 export function completeTask(
   paths: BusPaths,
@@ -484,28 +553,33 @@ export function completeTask(
   }
   appendTaskAudit(paths, taskId, { event: 'complete', agent: assignee || 'unknown', from: prevStatus, to: 'completed', note: result });
 
-  // Activity-feed event. Best-effort — the task is already persisted.
+  // Observability side-effects. The task is already persisted, so NOTHING in
+  // this block may throw past completion — an outer guard swallows even the
+  // path-prep, and the two writes are independently best-effort so a failure
+  // in one can't skip the other.
   if (assignee) {
     try {
-      // Cross-org completion (caller's org ≠ task's org) is allowed via
-      // findTaskFile, but the caller's `paths.analyticsDir` is scoped to
-      // the caller's org. Rewrite the analytics path to the task's actual
-      // org so dashboards/metrics see the completion under the right tree.
-      // Only rewrite analyticsDir when the resolved task path is in the
-      // nested cross-org layout: <ctxRoot>/orgs/<org>/tasks/<taskId>.json.
-      // Flat/single-org test harnesses use <ctxRoot>/tasks + <ctxRoot>/analytics
-      // and should keep the caller-provided analyticsDir unchanged.
-      const pathOrgMatch = filePath.match(/[\\/]orgs[\\/](?<org>[^\\/]+)[\\/]tasks[\\/]/);
-      const fileOrg = pathOrgMatch?.groups?.org || '';
-      const eventPaths: BusPaths = fileOrg
-        ? { ...paths, analyticsDir: join(paths.ctxRoot, 'orgs', fileOrg, 'analytics') }
-        : paths;
-      logEvent(eventPaths, assignee, taskOrg, 'task', 'task_completed', 'info', {
+      const eventPaths = analyticsPathsForTask(paths, filePath);
+
+      // 1. Activity-feed event (own guard so an event failure does not skip
+      //    the trajectory write below).
+      try {
+        logEvent(eventPaths, assignee, taskOrg, 'task', 'task_completed', 'info', {
+          task_id: taskId,
+          ...(result ? { result } : {}),
+        });
+      } catch {
+        // Never let observability break task completion.
+      }
+
+      // 2. Structured trajectory entry (also internally best-effort).
+      appendTrajectory(eventPaths, assignee, taskOrg, {
         task_id: taskId,
-        ...(result ? { result } : {}),
+        outcome: 'completed',
       });
     } catch {
-      // Never let observability break task completion.
+      // Belt-and-suspenders: even path-prep is swallowed so task completion
+      // can never be undone by observability.
     }
   }
 }
