@@ -117,7 +117,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(cfg.agent_name).toBe('codex-cfg');
   });
 
-  it('copies the 23 codex skills into plugins/cortextos-agent-skills/skills', async () => {
+  it('copies the 25 codex skills into plugins/cortextos-agent-skills/skills', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -134,7 +134,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const skills = readdirSync(skillsDir, { withFileTypes: true })
       .filter(d => d.isDirectory())
       .map(d => d.name);
-    expect(skills.length).toBe(24);
+    expect(skills.length).toBe(25);
     // Spot check: comms is the skill that teaches the Telegram reply pattern.
     expect(skills).toContain('comms');
     expect(skills).toContain('onboarding');
@@ -142,6 +142,9 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     // Pin it explicitly so a future regression that drops the file is caught
     // by name, not just by count.
     expect(skills).toContain('three-brain');
+    // skill-optimizer mirrored into the codex template 2026-06-06 (Hermes #1).
+    // Pin by name for the same drop-protection.
+    expect(skills).toContain('skill-optimizer');
   });
 
   it('creates ~/.codex/skills/<agent>__<skill> symlinks for every skill', async () => {
@@ -156,8 +159,9 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const codexSkillsDir = join(tempHome, '.codex', 'skills');
     expect(existsSync(codexSkillsDir)).toBe(true);
     const links = readdirSync(codexSkillsDir).filter(n => n.startsWith('codex-links__'));
-    expect(links.length).toBe(24);
+    expect(links.length).toBe(25);
     expect(links).toContain('codex-links__three-brain');
+    expect(links).toContain('codex-links__skill-optimizer');
 
     // Each entry must be a symlink (not a copy), pointing at the agent's local skill dir.
     for (const link of links) {

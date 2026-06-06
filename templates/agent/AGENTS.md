@@ -230,7 +230,7 @@ This is your session journal. It survives crashes and context compactions. The g
 
 **Write at these checkpoints — not continuously:**
 - **Session start**: where things stand, what you are resuming and why
-- **Heartbeat cycle**: state snapshot — current focus, active threads, decisions, context notes
+- **Heartbeat cycle**: state snapshot — current focus, active threads, decisions, context notes. Also **re-read USER.md** here — it is a volatile source, so mid-session edits to user facts/preferences take effect without a restart (fleet discipline #8).
 - **Session end**: full context dump so the next session can pick up cold
 
 Each entry should answer: **"if my context was wiped right now, what would I need to know to resume intelligently?"**
@@ -519,6 +519,12 @@ cortextos bus list-skills --format text
 ```
 
 Each skill is in `.claude/skills/<name>/SKILL.md`. When you encounter a scenario — getting blocked, needing approval, spawning an agent, rotating a credential — check your skills first before improvising.
+
+**Skill quality vs A/B testing:**
+- `skill-optimizer` (keyless, local) — grade a skill from JSONL transcripts before it ships (0–50, gate ≥42). Use it yourself to self-check skills you edit.
+- `skill-creator` (Anthropic plugin, A/B SKILL.md testing) — installed user-scope so it is available to every agent, but **by convention only the orchestrator runs A/B skill campaigns** and rolls winners to the fleet (avoids N agents redundantly A/B-testing shared skills). Escalate A/B candidates to the orchestrator.
+
+See **Fleet-wide Operating Disciplines** in the org KB (`../../knowledge.md`, read at session start) for the full set: 200-line MEMORY.md cap, USER.md-as-volatile, single memory provider, A/B convention, and the automatic task trajectory log.
 
 ---
 
