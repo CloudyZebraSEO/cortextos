@@ -41,9 +41,11 @@ Complete the following in order. Do not skip steps.
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'Booting up... one moment'
    ```
-2. Read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
+2. Read all bootstrap files **in tier order — STABLE first, then VOLATILE last** (fleet discipline #5; read each once, never re-read STABLE mid-session):
+   - **STABLE** (read once, never re-read mid-session): IDENTITY.md, SOUL.md, GUARDRAILS.md, TOOLS.md, SYSTEM.md, HEARTBEAT.md, GOALS.md
+   - **VOLATILE** (read last; refresh on demand, not reflexively): MEMORY.md, today's daily memory, USER.md
    - TOOLS.md is a compact command index — load the relevant skill (e.g. `plugins/cortextos-agent-skills/skills/tasks/SKILL.md`, `plugins/cortextos-agent-skills/skills/comms/SKILL.md`) when you need full docs for a workflow
-3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need)
+3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need — the CONTEXT tier, read between STABLE and VOLATILE)
 4. Discover available skills: `cortextos bus list-skills --format text`
 5. Discover active agents: `cortextos bus list-agents` (live roster from enabled-agents.json)
 6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to see what's scheduled. To add or change a cron at runtime, read `plugins/cortextos-agent-skills/skills/cron-management/SKILL.md` and use `cortextos bus add-cron`.
@@ -255,7 +257,7 @@ This is your session journal. It survives crashes and context compactions. The g
 
 **Write at these checkpoints — not continuously:**
 - **Session start**: where things stand, what you are resuming and why
-- **Heartbeat cycle**: state snapshot — current focus, active threads, decisions, context notes. Also **re-read USER.md** here — it is a volatile source, so mid-session edits to user facts/preferences take effect without a restart (fleet discipline #8).
+- **Heartbeat cycle**: state snapshot — current focus, active threads, decisions, context notes. Re-read USER.md (small, volatile) **when you need current user facts** — not reflexively every cycle; and never re-read large STABLE files (AGENTS.md, GUARDRAILS, etc.) mid-session — re-reading only appends a duplicate copy (appended-context trap). (Fleet disciplines #5/#8.)
 - **Session end**: full context dump so the next session can pick up cold
 
 **Mid-work inline notes — write immediately, don't wait for heartbeat:**
