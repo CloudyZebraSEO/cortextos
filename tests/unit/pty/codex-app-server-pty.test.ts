@@ -679,6 +679,26 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
     expect(out).toBe('just a chat message');
   });
 
+  it('plain-text TELEGRAM: a dynamically-sized (4-backtick) fence with a nested ```ts block is extracted WHOLE', () => {
+    // The producer (fast-checker wrapFenceSafe) grows the fence to 4 backticks
+    // when the body contains a ``` run. A fixed-3-backtick parser would truncate
+    // at the nested fence; the dynamic backreference parser must return the full
+    // body. (Regression for the merge integration miss — producer went dynamic,
+    // this consumer stayed fixed.)
+    const inject = `=== TELEGRAM from James (chat_id:7940429114) ===
+\`\`\`\`
+here is code:
+\`\`\`ts
+console.log(1)
+\`\`\`
+thanks
+\`\`\`\`
+Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
+`;
+    const out = extract(inject);
+    expect(out).toBe('here is code:\n```ts\nconsole.log(1)\n```\nthanks');
+  });
+
   it('reply_to with no outbound log: appends bare in-reply-to marker', () => {
     fsMocks.existsSync.mockImplementation((p: string) => !String(p).endsWith('outbound-messages.jsonl'));
     const inject = `=== TELEGRAM from James (chat_id:7940429114) ===
@@ -1411,5 +1431,32 @@ describe('CodexAppServerPTY resolveCodexBinary', () => {
     mockPlatformValue = 'win32';
     fsMocks.existsSync.mockImplementation((p: unknown) => String(p).endsWith('codex.cmd'));
     expect(callResolve(new CodexAppServerPTY(mockEnv, {}))).toBe('codex.cmd');
+  });
+});
+
+describe('CodexAppServerPTY buildMediaPayload — dynamic fence parsing', () => {
+  it('extracts a caption wrapped in a dynamically-sized (4-backtick) fence', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    // wrapFenceSafe grows the fence to 4 backticks when the caption contains ```;
+    // the consumer must match the same fence length, not a hard-coded ```.
+    const beforeReply = [
+      '=== TELEGRAM PHOTO from Alice (chat_id:1) ===',
+      'caption:',
+      '````',
+      'look at this ``` code',
+      '````',
+      'local_file: /tmp/p.jpg',
+    ].join('\n');
+    const payload = (pty as unknown as { buildMediaPayload(t: string, b: string): string | null })
+      .buildMediaPayload('PHOTO', beforeReply);
+    expect(payload).toContain('caption: look at this ``` code');
+  });
+
+  it('still extracts a caption in a plain 3-backtick fence', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    const beforeReply = '=== TELEGRAM PHOTO from Bob (chat_id:2) ===\ncaption:\n```\nhello\n```\nlocal_file: /tmp/x.jpg';
+    const payload = (pty as unknown as { buildMediaPayload(t: string, b: string): string | null })
+      .buildMediaPayload('PHOTO', beforeReply);
+    expect(payload).toContain('caption: hello');
   });
 });

@@ -26,6 +26,10 @@ interface IPtySpawnOptions {
   rows?: number;
   cwd?: string;
   env?: Record<string, string>;
+  // Windows ConPTY backend toggle (node-pty IWindowsPtyForkOptions). We pin it
+  // on for the Windows fork; included here so `tsc --noEmit` type-checks the
+  // spawn call (the base IPtyForkOptions omits this Windows-only field).
+  useConpty?: boolean;
 }
 
 type SpawnFn = (file: string, args: string[], options: IPtySpawnOptions) => IPty;
@@ -319,9 +323,15 @@ export class CodexAppServerPTY {
       break;
     }
 
-    const fencedBlocks = [...beforeReply.matchAll(/```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/g)];
+    // Dynamically-sized fence (3+ backticks): the producer wraps plain Telegram
+    // text with wrapFenceSafe, which GROWS the fence to outlast any backtick run
+    // in the body (e.g. a nested ```ts block forces a 4-backtick wrapper). The
+    // close must therefore be the SAME length as the open (backreference \1), or
+    // a fixed-``` parser truncates the body at the first nested fence. Mirrors
+    // buildMediaPayload's parser. Group 1 = fence, group 2 = body.
+    const fencedBlocks = [...beforeReply.matchAll(/(`{3,})(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n\1/g)];
     if (fencedBlocks.length > 0) {
-      return wrap(fencedBlocks[fencedBlocks.length - 1]?.[1]?.trim() || null);
+      return wrap(fencedBlocks[fencedBlocks.length - 1]?.[2]?.trim() || null);
     }
 
     for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -337,11 +347,14 @@ export class CodexAppServerPTY {
   }
 
   private buildMediaPayload(mediaType: string, beforeReply: string): string | null {
-    const captionMatch = beforeReply.match(/caption:\s*\n```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/);
-    const caption = captionMatch?.[1]?.trim() ?? '';
+    // Match a dynamically-sized fence (3+ backticks): wrapFenceSafe grows the
+    // fence to outlast any backtick run in the body, so the close must be the
+    // same length as the open (backreference \1). Group 2 is the body.
+    const captionMatch = beforeReply.match(/caption:\s*\n(`{3,})(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n\1/);
+    const caption = captionMatch?.[2]?.trim() ?? '';
 
-    const transcriptMatch = beforeReply.match(/transcript:\s*\n```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/);
-    const transcript = transcriptMatch?.[1]?.trim() ?? '';
+    const transcriptMatch = beforeReply.match(/transcript:\s*\n(`{3,})(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n\1/);
+    const transcript = transcriptMatch?.[2]?.trim() ?? '';
 
     const localFileMatch = beforeReply.match(/^local_file:\s*(.+)$/m);
     const localFile = localFileMatch?.[1]?.trim() ?? '';
