@@ -679,6 +679,26 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
     expect(out).toBe('just a chat message');
   });
 
+  it('plain-text TELEGRAM: a dynamically-sized (4-backtick) fence with a nested ```ts block is extracted WHOLE', () => {
+    // The producer (fast-checker wrapFenceSafe) grows the fence to 4 backticks
+    // when the body contains a ``` run. A fixed-3-backtick parser would truncate
+    // at the nested fence; the dynamic backreference parser must return the full
+    // body. (Regression for the merge integration miss — producer went dynamic,
+    // this consumer stayed fixed.)
+    const inject = `=== TELEGRAM from James (chat_id:7940429114) ===
+\`\`\`\`
+here is code:
+\`\`\`ts
+console.log(1)
+\`\`\`
+thanks
+\`\`\`\`
+Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
+`;
+    const out = extract(inject);
+    expect(out).toBe('here is code:\n```ts\nconsole.log(1)\n```\nthanks');
+  });
+
   it('reply_to with no outbound log: appends bare in-reply-to marker', () => {
     fsMocks.existsSync.mockImplementation((p: string) => !String(p).endsWith('outbound-messages.jsonl'));
     const inject = `=== TELEGRAM from James (chat_id:7940429114) ===

@@ -323,9 +323,15 @@ export class CodexAppServerPTY {
       break;
     }
 
-    const fencedBlocks = [...beforeReply.matchAll(/```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/g)];
+    // Dynamically-sized fence (3+ backticks): the producer wraps plain Telegram
+    // text with wrapFenceSafe, which GROWS the fence to outlast any backtick run
+    // in the body (e.g. a nested ```ts block forces a 4-backtick wrapper). The
+    // close must therefore be the SAME length as the open (backreference \1), or
+    // a fixed-``` parser truncates the body at the first nested fence. Mirrors
+    // buildMediaPayload's parser. Group 1 = fence, group 2 = body.
+    const fencedBlocks = [...beforeReply.matchAll(/(`{3,})(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n\1/g)];
     if (fencedBlocks.length > 0) {
-      return wrap(fencedBlocks[fencedBlocks.length - 1]?.[1]?.trim() || null);
+      return wrap(fencedBlocks[fencedBlocks.length - 1]?.[2]?.trim() || null);
     }
 
     for (let i = lines.length - 1; i >= 0; i -= 1) {
