@@ -54,6 +54,15 @@ Each dimension is scored by deterministic transcript signals and deductions. Tre
 
 When multiple transcripts are supplied, the gate uses the average score and also fails to `NO_SHIP` if any individual run is below 35. For production readiness, use at least three runs.
 
+## Evaluation Protocol: ship-set vs. discrimination controls (MANDATORY)
+
+The ship-decision set and any deliberate NO_SHIP / discrimination-control transcripts MUST be graded as **separate batches**. Never let a synthetic-failure control enter the `--transcript` set that produces a real ship decision.
+
+Why: the gate fails the whole aggregate to `NO_SHIP` if ANY single run scores `<35` (by design — a real run that bad should block the skill). A purpose-built failing control (e.g. "agent never sent the reply") is *meant* to score `<35`; if you mix it into the ship set it will sink an otherwise-shippable skill's aggregate and produce a false NO_SHIP. (A control that lands in `REVIEW_REQUIRED`, ≥35, won't trip this — which is exactly why the bug hides until a harder control exposes it.)
+
+- **Ship-decision batch**: only representative runs of the skill working correctly (≥3). Its aggregate drives the ship/no-ship call.
+- **Control batch**: deliberate failure/edge runs, graded in a *separate* invocation, used only to confirm the gate still has teeth (the control SHOULD score `REVIEW_REQUIRED` or `NO_SHIP`).
+
 ## Outputs
 
 The grader writes:
