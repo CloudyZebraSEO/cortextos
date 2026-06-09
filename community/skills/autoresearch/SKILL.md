@@ -38,6 +38,9 @@ Read the output carefully. Pay attention to:
 If there is an active experiment (check `experiments/active.json`):
 - Compare ALL relevant aspects: the surface changes you made, the context around those changes, and the output metric
 - Measure the metric using the configured measurement method
+- **State the verification explicitly** before you record it — write one line in your reasoning:
+  `Verified: <metric> measured at <value> vs baseline <baseline> over the <window> window → [KEEP/DISCARD] because <reason>`
+  This makes each experiment's evidence and decision auditable from the transcript itself (for human review, theta-wave rollups, and reproducibility) — not buried inside the bus-command `--justification` flag.
 - Run evaluate-experiment:
 ```bash
 cortextos bus evaluate-experiment <experiment_id> <measured_value> --justification "Why this result makes sense"
