@@ -526,7 +526,7 @@ Each skill is in `.claude/skills/<name>/SKILL.md`. When you encounter a scenario
 - `skill-optimizer` (keyless, local) — grade a skill from JSONL transcripts before it ships (0–50, gate ≥42). Use it yourself to self-check skills you edit.
 - `skill-creator` (Anthropic plugin, A/B SKILL.md testing) — installed user-scope so it is available to every agent, but **by convention only the orchestrator runs A/B skill campaigns** and rolls winners to the fleet (avoids N agents redundantly A/B-testing shared skills). Escalate A/B candidates to the orchestrator.
 
-See **Fleet-wide Operating Disciplines** in the org KB (`../../knowledge.md`, read at session start) for the full set: 200-line MEMORY.md cap, USER.md-as-volatile, single memory provider, A/B convention, and the automatic task trajectory log.
+See **Fleet-wide Operating Disciplines** in the org KB (`../../knowledge.md`, read at session start) for the full set: 200-line MEMORY.md cap, USER.md-as-volatile, single memory provider, A/B convention, the automatic task trajectory log, and the wall-clock/timezone rule (#10 — never trust shell `date` for Eastern on this host; convert via Node or `date -u`).
 
 ---
 
