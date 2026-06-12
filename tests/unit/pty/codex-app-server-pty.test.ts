@@ -191,6 +191,23 @@ describe('CodexAppServerPTY command mapping', () => {
     expect(pty.getOutputBuffer().getRecent()).toContain('[goal] none set');
   });
 
+  it('submits on a CRLF (\\r\\n) write, not just a lone CR — idle-injection fix, fleet-safe', async () => {
+    // injectMessage now sends CRLF as the deferred submit (the claude-code
+    // idle-prompt swallow fix). This runtime intercepts writes, so write() must
+    // treat \r\n as a submit too — otherwise injected cron/telegram messages
+    // buffer forever and the codex agent wedges. Negative-control: with the old
+    // exact `data === '\r'`, \r\n falls to buffer-append and this RPC is NEVER
+    // called (the test fails), proving the guard reproduces-then-resolves the
+    // cross-runtime regression the same way the claude-code inject test does.
+    requestMock.mockResolvedValue({ result: { goal: null } });
+    const pty = makeReadyPty();
+    pty.write('/goal');
+    pty.write('\r\n');
+    await Promise.resolve();
+    expect(requestMock).toHaveBeenCalledWith('thread/goal/get', { threadId: 'thread-1' });
+    expect(pty.getOutputBuffer().getRecent()).toContain('[goal] none set');
+  });
+
   it('maps Telegram-delivered /goal with bot suffix to native goal get', async () => {
     requestMock.mockResolvedValue({ result: { goal: null } });
     const pty = makeReadyPty();
