@@ -114,9 +114,10 @@ export const ecosystemCommand = new Command('ecosystem')
       // Dashboard reads its real config from dashboard/.env.local — populated
       // by /onboarding Phase 7. PM2 just supervises the dashboard process.
       windowsHide: true,
+      min_uptime: 60000,
+      exp_backoff_restart_delay: 5000,
       max_restarts: 50,
-      min_uptime: '30s',
-      exp_backoff_restart_delay: 100,
+      restart_delay: 5000,
       autorestart: true,
     }`
       : '';
@@ -153,9 +154,10 @@ module.exports = {
       // Suppress the transient console window PM2 would otherwise flash when
       // (re)spawning the daemon on Windows. Matches the dashboard block.
       windowsHide: true,
+      min_uptime: 60000,
+      exp_backoff_restart_delay: 5000,
       max_restarts: 50,
-      min_uptime: '30s',
-      exp_backoff_restart_delay: 100,
+      restart_delay: 5000,
       autorestart: true,
     }${dashboardAppBlock},
   ],

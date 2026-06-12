@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { TelegramPoller } from '../../../src/telegram/poller';
+import { ESCALATE_AFTER_MS, TelegramPoller } from '../../../src/telegram/poller';
 import type { TelegramAPI } from '../../../src/telegram/api';
 import type { TelegramUpdate } from '../../../src/types/index';
 
@@ -222,5 +222,107 @@ describe('TelegramPoller — offset-after-handler', () => {
       const persisted = readFileSync(offsetFile, 'utf-8').trim();
       expect(persisted).toBe('0');
     }
+  });
+});
+
+describe('TelegramPoller — self-healing loop', () => {
+  let stateDir: string;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-12T12:00:00Z'));
+    stateDir = mkdtempSync(join(tmpdir(), 'cortextos-poller-selfheal-'));
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+    vi.useRealTimers();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it('backs off, rate-limits stack logging, and exits poll-stuck after sustained fetch failure', async () => {
+    const api = {
+      getUpdates: vi.fn(async () => {
+        throw new Error('fetch failed');
+      }),
+    } as unknown as TelegramAPI;
+    const poller = new TelegramPoller(api, stateDir);
+
+    const started = poller.start();
+    await vi.advanceTimersByTimeAsync(ESCALATE_AFTER_MS + 60_000);
+    await started;
+
+    expect(poller.lastExitReason).toBe('poll-stuck');
+    expect(api.getUpdates).toHaveBeenCalled();
+    const fullErrorLines = errorSpy.mock.calls.filter((call) => String(call[0]).includes('Poll error'));
+    const summaryLines = errorSpy.mock.calls.filter((call) => String(call[0]).includes('poll still failing'));
+    expect(fullErrorLines).toHaveLength(1);
+    expect(summaryLines.length).toBeLessThanOrEqual(1);
+  });
+
+  it('fires onApiSuccess, logs recovery, and resets failure counters after a transient failure', async () => {
+    const api = {
+      getUpdates: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('fetch failed'))
+        .mockResolvedValue({ result: [] }),
+    } as unknown as TelegramAPI;
+    const poller = new TelegramPoller(api, stateDir);
+    const onApiSuccess = vi.fn(() => poller.stop());
+    poller.onApiSuccess = onApiSuccess;
+
+    const started = poller.start();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await started;
+
+    expect(onApiSuccess).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls.some((call) => String(call[0]).includes('recovered after 1 failure'))).toBe(true);
+    expect(poller.lastExitReason).toBe('stopped-externally');
+  });
+
+  it('exits auth-failed on permanent Telegram token errors', async () => {
+    const api = {
+      getUpdates: vi.fn(async () => {
+        throw new Error('Telegram API error: Unauthorized');
+      }),
+    } as unknown as TelegramAPI;
+    const poller = new TelegramPoller(api, stateDir);
+
+    await poller.start();
+
+    expect(poller.lastExitReason).toBe('auth-failed');
+    expect(api.getUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves conflict self-die behavior', async () => {
+    const api = {
+      getUpdates: vi.fn(async () => {
+        throw new Error('Telegram API error: Conflict: terminated by other getUpdates request');
+      }),
+    } as unknown as TelegramAPI;
+    const poller = new TelegramPoller(api, stateDir);
+
+    await poller.start();
+
+    expect(poller.lastExitReason).toBe('conflict-self-die');
+    expect(api.getUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks API success before handler dispatch, so handler failures do not hide reachability', async () => {
+    const { api } = makeStubApi([makeMessageUpdate(700, 'handler fails')]);
+    const poller = new TelegramPoller(api, stateDir);
+    const onApiSuccess = vi.fn();
+    poller.onApiSuccess = onApiSuccess;
+    poller.onMessage(() => {
+      throw new Error('handler failed');
+    });
+
+    await poller.pollOnce();
+
+    expect(onApiSuccess).toHaveBeenCalledTimes(1);
+    const offsetFile = join(stateDir, '.telegram-offset');
+    expect(existsSync(offsetFile)).toBe(false);
   });
 });

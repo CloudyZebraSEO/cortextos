@@ -30,6 +30,8 @@ module.exports = {
       // Suppress the transient console window PM2 would otherwise flash when
       // (re)spawning the daemon on Windows. Matches the dashboard block.
       windowsHide: true,
+      min_uptime: 60000,
+      exp_backoff_restart_delay: 5000,
       max_restarts: 50,
       restart_delay: 5000,
       autorestart: true,
@@ -45,6 +47,8 @@ module.exports = {
       // Dashboard reads its real config from dashboard/.env.local — populated
       // by /onboarding Phase 7. PM2 just supervises the dashboard process.
       windowsHide: true,
+      min_uptime: 60000,
+      exp_backoff_restart_delay: 5000,
       max_restarts: 50,
       restart_delay: 5000,
       autorestart: true,

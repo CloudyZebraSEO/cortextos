@@ -9,6 +9,7 @@ import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
+import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
@@ -19,11 +20,41 @@ import { stripBom } from '../utils/strip-bom.js';
 
 type LogFn = (msg: string) => void;
 
+const SUPERVISOR_RESTART_BACKOFF_MS = 30_000;
+const AUTH_FAIL_BACKOFF_MS = 300_000;
+const ESCALATE_AFTER_MS = 120_000;
+const DAEMON_SELF_RESTART_MS = 600_000;
+const WATCHDOG_INTERVAL_MS = 60_000;
+const SELF_RESTART_MIN_INTERVAL_MS = 1_800_000;
+
+type PollerKind = 'primary' | 'activity';
+
+interface PollerLiveness {
+  lastApiOkAt: number;
+  createdAt: number;
+  authFailed: boolean;
+  wasStale: boolean;
+  authAlerted: boolean;
+}
+
+interface ManagedAgentEntry {
+  process: AgentProcess;
+  checker: FastChecker;
+  poller?: TelegramPoller;
+  activityPoller?: TelegramPoller;
+  pollerLiveness?: PollerLiveness;
+  activityPollerLiveness?: PollerLiveness;
+  telegramRejectCount?: number;
+  telegramLastRejectAlertAt?: number;
+  telegramApi?: TelegramAPI;
+  telegramChatId?: string;
+}
+
 /**
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
-  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller; telegramRejectCount?: number; telegramLastRejectAlertAt?: number }> = new Map();
+  private agents: Map<string, ManagedAgentEntry> = new Map();
   private workers: Map<string, WorkerProcess> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
@@ -34,6 +65,8 @@ export class AgentManager {
   private ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
+  private telegramWatchdogTimer?: ReturnType<typeof setInterval>;
+  private exitProcess: (code: number) => never = (code) => process.exit(code);
 
   // Set true at construction time if any agent in state/ has a stale
   // .daemon-crashed marker, meaning the previous daemon process died
@@ -53,6 +86,136 @@ export class AgentManager {
     if (this.daemonJustCrashed) {
       console.log('[agent-manager] Detected .daemon-crashed marker(s) — previous daemon exited abnormally. Will quiet BUG-011 alarm for this startup cycle.');
     }
+    this.startTelegramPollerWatchdog();
+  }
+
+  private startTelegramPollerWatchdog(): void {
+    if (this.telegramWatchdogTimer) return;
+    this.telegramWatchdogTimer = setInterval(() => {
+      this.checkTelegramPollerLiveness();
+    }, WATCHDOG_INTERVAL_MS);
+    this.telegramWatchdogTimer.unref?.();
+  }
+
+  private selfRestartStatePath(): string {
+    return join(this.ctxRoot, 'state', 'daemon-self-restart.json');
+  }
+
+  private readLastSelfRestartAt(): number {
+    try {
+      const raw = readFileSync(this.selfRestartStatePath(), 'utf-8');
+      const parsed = JSON.parse(raw);
+      return typeof parsed?.ts === 'number' ? parsed.ts : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private writeSelfRestartState(reason: string, staleAgents: string[], now: number): void {
+    atomicWriteSync(this.selfRestartStatePath(), JSON.stringify({ ts: now, reason, staleAgents }, null, 2));
+  }
+
+  private createPollerLiveness(now = Date.now()): PollerLiveness {
+    return {
+      lastApiOkAt: 0,
+      createdAt: now,
+      authFailed: false,
+      wasStale: false,
+      authAlerted: false,
+    };
+  }
+
+  private markPollerApiSuccess(name: string, kind: PollerKind, log: LogFn, api?: TelegramAPI, chatId?: string): void {
+    const entry = this.agents.get(name);
+    if (!entry) return;
+    const liveness = kind === 'primary' ? entry.pollerLiveness : entry.activityPollerLiveness;
+    if (!liveness) return;
+    const wasStale = liveness.wasStale;
+    liveness.lastApiOkAt = Date.now();
+    liveness.authFailed = false;
+    liveness.wasStale = false;
+    if (wasStale) {
+      const msg = `${name}: ${kind} Telegram poller recovered after stale API window.`;
+      log(msg);
+      api?.sendMessage(chatId ?? '', `✅ WATCHDOG: ${msg}`).catch(() => {});
+    }
+  }
+
+  private isEntryRunning(entry: ManagedAgentEntry): boolean {
+    try {
+      return entry.process.getStatus().status === 'running';
+    } catch {
+      return false;
+    }
+  }
+
+  private isPollerStale(liveness: PollerLiveness, now: number): boolean {
+    if (liveness.authFailed) return false;
+    if (now - liveness.createdAt <= ESCALATE_AFTER_MS) return false;
+    const reference = liveness.lastApiOkAt > 0 ? liveness.lastApiOkAt : liveness.createdAt;
+    return now - reference > DAEMON_SELF_RESTART_MS;
+  }
+
+  private async alertSelfRestart(message: string): Promise<void> {
+    for (const entry of this.agents.values()) {
+      if (entry.telegramApi && entry.telegramChatId) {
+        try {
+          await entry.telegramApi.sendMessage(entry.telegramChatId, message);
+        } catch {
+          // Best effort; daemon log below is the reliable signal.
+        }
+        return;
+      }
+    }
+  }
+
+  private checkTelegramPollerLiveness(now = Date.now()): void {
+    let staleCount = 0;
+    let totalActiveTelegramPollers = 0;
+    const staleAgents: string[] = [];
+
+    for (const [name, entry] of this.agents) {
+      if (!this.isEntryRunning(entry)) continue;
+
+      const pollers: Array<[PollerKind, PollerLiveness | undefined]> = [
+        ['primary', entry.pollerLiveness],
+        ['activity', entry.activityPollerLiveness],
+      ];
+
+      for (const [kind, liveness] of pollers) {
+        if (!liveness || liveness.authFailed) continue;
+        totalActiveTelegramPollers += 1;
+        const stale = this.isPollerStale(liveness, now);
+        liveness.wasStale = liveness.wasStale || stale;
+        if (stale) {
+          staleCount += 1;
+          staleAgents.push(`${name}:${kind}`);
+        }
+      }
+    }
+
+    if (totalActiveTelegramPollers === 0) return;
+    const threshold = Math.min(2, totalActiveTelegramPollers);
+    if (staleCount < threshold) return;
+
+    const lastRestartAt = this.readLastSelfRestartAt();
+    const reason = `telegram-poller-stale:${staleAgents.join(',')}`;
+    if (now - lastRestartAt < SELF_RESTART_MIN_INTERVAL_MS) {
+      const remainingMs = SELF_RESTART_MIN_INTERVAL_MS - (now - lastRestartAt);
+      console.error(
+        `[agent-manager] Telegram poller watchdog would self-restart for ${reason}, but rate-limit is active for ${Math.ceil(remainingMs / 1000)}s`,
+      );
+      this.alertSelfRestart(
+        `⚠️ WATCHDOG: Telegram pollers stale (${staleAgents.join(', ')}), but daemon self-restart is rate-limited for ${Math.ceil(remainingMs / 1000)}s.`,
+      ).catch(() => {});
+      return;
+    }
+
+    this.writeSelfRestartState(reason, staleAgents, now);
+    console.error(`[agent-manager] Telegram poller watchdog self-restarting daemon: ${reason}`);
+    this.alertSelfRestart(
+      `🚨 WATCHDOG: Telegram pollers stale (${staleAgents.join(', ')}). Restarting daemon to clear poisoned Telegram transport state.`,
+    ).finally(() => this.exitProcess(1));
   }
 
   /**
@@ -403,7 +566,12 @@ export class AgentManager {
       });
     }
 
-    this.agents.set(name, { process: agentProcess, checker });
+    this.agents.set(name, {
+      process: agentProcess,
+      checker,
+      telegramApi,
+      telegramChatId: chatId,
+    });
 
     // Start agent
     await agentProcess.start();
@@ -443,12 +611,18 @@ export class AgentManager {
     // running its own poller (only the designated orchestrator agent should poll).
     if (telegramApi && chatId && config.telegram_polling !== false) {
       const stateDir = join(this.ctxRoot, 'state', name);
-      const poller = new TelegramPoller(telegramApi, stateDir);
+      let currentPoller = new TelegramPoller(telegramApi, stateDir);
+      currentPoller.onApiSuccess = () => this.markPollerApiSuccess(name, 'primary', log, telegramApi, chatId);
+      const entry = this.agents.get(name);
+      if (entry) {
+        entry.poller = currentPoller;
+        entry.pollerLiveness = this.createPollerLiveness();
+      }
 
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
-      poller.onMessage(async (msg) => {
+      currentPoller.onMessage(async (msg) => {
         // ALLOWED_USER gate: comma-separated list of numeric user IDs.
         // If configured, ignore messages from other users. Always log the
         // rejected user_id + name so operators can discover IDs to whitelist.
@@ -574,7 +748,7 @@ export class AgentManager {
         checker.queueTelegramMessage(formatted);
       });
 
-      poller.onCallback((query) => {
+      currentPoller.onCallback((query) => {
         // Route to fast-checker for hook response handling (perm_allow/deny, askopt, etc.)
         // handleCallback writes hook-response files and edits Telegram messages
         checker.handleCallback(query).catch(err => {
@@ -582,7 +756,7 @@ export class AgentManager {
         });
       });
 
-      poller.onReaction((reaction) => {
+      currentPoller.onReaction((reaction) => {
         // ALLOWED_USER gate: same multi-user rule as message handler.
         if (allowedUserId) {
           const allowedIds = allowedUserId.split(',').map((s) => parseInt(s.trim(), 10));
@@ -629,48 +803,40 @@ export class AgentManager {
         checker.queueTelegramMessage(formatted);
       });
 
-      // Wrap poller.start() in a restart-on-Conflict loop. The poller's
-      // internal Conflict-self-die (see TelegramPoller.start) yields the
-      // Telegram getUpdates lock when a duplicate poller is detected — but
-      // without a restart layer above, the agent loses Telegram input
-      // permanently. After a daemon crash, the old getUpdates connections
-      // can hold the lock for ~60s in Telegram's cloud, so this loop
-      // sleeps and retries on 'conflict-self-die' until the lock clears.
-      // Intentional stops (stopAgent → poller.stop()) set
-      // lastExitReason='stopped-externally' and exit the loop cleanly.
+      // Wrap poller.start() in a restart loop. Tier 1 exits on bounded
+      // sustained failure, auth failure, or Conflict; this supervisor keeps
+      // Telegram reachable without permanently giving up on transient states.
       const startPrimaryPollerWithRestart = async () => {
-        // 5min hard cap measured against CONSECUTIVE Conflict failures,
-        // not total wrapper lifetime. A long-running successful poll
-        // (>1min) resets the counter — without this reset, a poller that
-        // runs cleanly for hours and then hits a single Conflict would
-        // give up immediately because total runtime already exceeds 5min.
-        const MAX_CONSECUTIVE_CONFLICT_MS = 5 * 60 * 1000;
-        const LONG_RUN_RESET_MS = 60_000;
-        let consecutiveConflictStart: number | null = null;
         while (true) {
-          // Pre-check: agent may have been deleted from registry during
-          // a previous sleep window. Skip the start() call entirely.
           if (!this.agents.has(name)) return;
-          const runStart = Date.now();
           try {
-            await poller.start();
+            await currentPoller.start();
           } catch (err) {
             log(`Telegram poller threw (will not restart): ${err}`);
             return;
           }
-          const runDuration = Date.now() - runStart;
-          if (poller.lastExitReason === 'stopped-externally') return;
+          const reason = currentPoller.lastExitReason;
+          if (reason === 'stopped-externally') return;
           if (!this.agents.has(name)) return;
-          // A poll session that ran for >LONG_RUN_RESET_MS proves the
-          // Conflict lock is no longer chronic — reset the retry budget.
-          if (runDuration > LONG_RUN_RESET_MS) consecutiveConflictStart = null;
-          if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
-          if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
-            log(`Telegram poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up. Inspect for duplicate bot instance.`);
-            return;
+
+          const entry = this.agents.get(name);
+          if (reason === 'auth-failed') {
+            if (entry?.pollerLiveness) entry.pollerLiveness.authFailed = true;
+            log(`Telegram poller for ${name} exited auth-failed. Alerting operator once and retrying in ${AUTH_FAIL_BACKOFF_MS / 1000}s.`);
+            if (entry?.pollerLiveness && !entry.pollerLiveness.authAlerted) {
+              entry.pollerLiveness.authAlerted = true;
+              telegramApi.sendMessage(
+                chatId,
+                `⚠️ WATCHDOG: ${name} Telegram poller auth failed (bad/revoked BOT_TOKEN). Fix credentials; daemon will retry slowly without self-restarting.`,
+              ).catch(() => {});
+            }
+            await new Promise(r => setTimeout(r, AUTH_FAIL_BACKOFF_MS));
+            if (!this.agents.has(name)) return;
+            continue;
           }
-          log(`Telegram poller for ${name} exited (${poller.lastExitReason}). Sleeping 30s then restarting to retake getUpdates lock.`);
-          await new Promise(r => setTimeout(r, 30_000));
+
+          log(`Telegram poller for ${name} exited (${reason}). Sleeping ${SUPERVISOR_RESTART_BACKOFF_MS / 1000}s then restarting.`);
+          await new Promise(r => setTimeout(r, SUPERVISOR_RESTART_BACKOFF_MS));
         }
       };
       startPrimaryPollerWithRestart().catch(err => {
@@ -689,11 +855,7 @@ export class AgentManager {
         }
       });
 
-      // Store poller reference so stopAgent() can clean it up
-      const entry = this.agents.get(name);
-      if (entry) entry.poller = poller;
-
-      log('Telegram poller started (with Conflict-restart wrapper)');
+      log('Telegram poller started (with self-healing restart wrapper)');
 
       // Orchestrator-only: start a second poller for the org's activity
       // channel bot so Telegram inline-button callbacks (currently just
@@ -770,7 +932,13 @@ export class AgentManager {
     // offsetFileSuffix keeps the activity poller's offset file distinct
     // from the primary bot's .telegram-offset — without this they would
     // clobber each other in the same stateDir.
-    const activityPoller = new TelegramPoller(activityApi, stateDir, 1000, 'activity');
+    let activityPoller = new TelegramPoller(activityApi, stateDir, 1000, 'activity');
+    activityPoller.onApiSuccess = () => this.markPollerApiSuccess(name, 'activity', log, activityApi, activityChatId);
+    const initialEntry = this.agents.get(name);
+    if (initialEntry) {
+      initialEntry.activityPoller = activityPoller;
+      initialEntry.activityPollerLiveness = this.createPollerLiveness();
+    }
 
     activityPoller.onCallback((query) => {
       const entry = this.agents.get(name);
@@ -789,44 +957,46 @@ export class AgentManager {
       log(`[activity-channel inbound] from ${from}: ${text.slice(0, 120)}`);
     });
 
-    // Same Conflict-restart wrapper as the primary poller — activity
-    // channel can lose its getUpdates lock after a daemon crash too.
-    // 5min retry budget measured against CONSECUTIVE failures; resets
-    // after a >1min successful run. See primary poller wrapper for rationale.
+    // Same self-healing wrapper as the primary poller — activity channel
+    // can lose either its getUpdates lock or its transport state too.
     const startActivityPollerWithRestart = async () => {
-      const MAX_CONSECUTIVE_CONFLICT_MS = 5 * 60 * 1000;
-      const LONG_RUN_RESET_MS = 60_000;
-      let consecutiveConflictStart: number | null = null;
       while (true) {
         if (!this.agents.has(name)) return;
-        const runStart = Date.now();
         try {
           await activityPoller.start();
         } catch (err) {
           log(`Activity-channel poller threw (will not restart): ${err}`);
           return;
         }
-        const runDuration = Date.now() - runStart;
-        if (activityPoller.lastExitReason === 'stopped-externally') return;
+        const reason = activityPoller.lastExitReason;
+        if (reason === 'stopped-externally') return;
         if (!this.agents.has(name)) return;
-        if (runDuration > LONG_RUN_RESET_MS) consecutiveConflictStart = null;
-        if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
-        if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
-          log(`Activity-channel poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up.`);
-          return;
+
+        const entry = this.agents.get(name);
+        if (reason === 'auth-failed') {
+          if (entry?.activityPollerLiveness) entry.activityPollerLiveness.authFailed = true;
+          log(`Activity-channel poller for ${name} exited auth-failed. Retrying in ${AUTH_FAIL_BACKOFF_MS / 1000}s.`);
+          if (entry?.activityPollerLiveness && !entry.activityPollerLiveness.authAlerted) {
+            entry.activityPollerLiveness.authAlerted = true;
+            activityApi.sendMessage(
+              activityChatId,
+              `⚠️ WATCHDOG: ${name} activity-channel poller auth failed (bad/revoked ACTIVITY_BOT_TOKEN). Fix credentials; daemon will retry slowly without self-restarting.`,
+            ).catch(() => {});
+          }
+          await new Promise(r => setTimeout(r, AUTH_FAIL_BACKOFF_MS));
+          if (!this.agents.has(name)) return;
+          continue;
         }
-        log(`Activity-channel poller for ${name} exited (${activityPoller.lastExitReason}). Sleeping 30s then restarting.`);
-        await new Promise(r => setTimeout(r, 30_000));
+
+        log(`Activity-channel poller for ${name} exited (${reason}). Sleeping ${SUPERVISOR_RESTART_BACKOFF_MS / 1000}s then restarting.`);
+        await new Promise(r => setTimeout(r, SUPERVISOR_RESTART_BACKOFF_MS));
       }
     };
     startActivityPollerWithRestart().catch((err) => {
       log(`Activity-channel poller wrapper crashed: ${err}`);
     });
 
-    const entry = this.agents.get(name);
-    if (entry) entry.activityPoller = activityPoller;
-
-    log(`Activity-channel poller started (chat ${activityChatId}, with Conflict-restart wrapper)`);
+    log(`Activity-channel poller started (chat ${activityChatId}, with self-healing restart wrapper)`);
   }
 
   /**
@@ -908,6 +1078,11 @@ export class AgentManager {
    * time `pty.kill()` runs, every agent already has its marker on disk.
    */
   async stopAll(): Promise<void> {
+    if (this.telegramWatchdogTimer) {
+      clearInterval(this.telegramWatchdogTimer);
+      this.telegramWatchdogTimer = undefined;
+    }
+
     const names = [...this.agents.keys()];
 
     for (const name of names) {

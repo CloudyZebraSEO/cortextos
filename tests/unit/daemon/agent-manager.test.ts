@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildReplyContext } from '../../../src/daemon/agent-manager.js';
@@ -444,5 +444,162 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
     const result = am.reloadCrons('ghost');
     expect(result).toBe(false);
     expect((am as any).cronSchedulers.has('ghost')).toBe(false);
+  });
+});
+
+describe('AgentManager Telegram poller watchdog', () => {
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+  let am: InstanceType<typeof AgentManager>;
+  let exitSpy: ReturnType<typeof vi.fn>;
+
+  const now = new Date('2026-06-12T18:00:00Z').getTime();
+
+  function runningProcess() {
+    return { getStatus: () => ({ status: 'running' }) } as any;
+  }
+
+  function stoppedProcess() {
+    return { getStatus: () => ({ status: 'stopped' }) } as any;
+  }
+
+  function staleLiveness(overrides: Record<string, unknown> = {}) {
+    return {
+      lastApiOkAt: now - 700_000,
+      createdAt: now - 700_000,
+      authFailed: false,
+      wasStale: false,
+      authAlerted: false,
+      ...overrides,
+    };
+  }
+
+  async function flushWatchdogExit() {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-watchdog-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'state'), { recursive: true });
+    am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).telegramWatchdogTimer && clearInterval((am as any).telegramWatchdogTimer);
+    (am as any).telegramWatchdogTimer = undefined;
+    exitSpy = vi.fn(() => undefined as never);
+    (am as any).exitProcess = exitSpy;
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('self-restarts a single-agent install when its only Telegram poller is stale', async () => {
+    (am as any).agents.set('alice', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness(),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const state = JSON.parse(readFileSync(join(ctxRoot, 'state', 'daemon-self-restart.json'), 'utf-8'));
+    expect(state.reason).toContain('telegram-poller-stale:alice:primary');
+    expect(state.staleAgents).toEqual(['alice:primary']);
+  });
+
+  it('requires two stale pollers when multiple active pollers exist', async () => {
+    (am as any).agents.set('alice', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness(),
+    });
+    (am as any).agents.set('bob', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness({ lastApiOkAt: now - 10_000 }),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not count auth-failed pollers toward stale daemon restarts', async () => {
+    (am as any).agents.set('alice', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness({ authFailed: true }),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it('ignores young pollers during the initial grace window', async () => {
+    (am as any).agents.set('alice', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness({
+        lastApiOkAt: 0,
+        createdAt: now - 60_000,
+      }),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it('respects the persisted 30-minute self-restart rate limit', async () => {
+    writeFileSync(
+      join(ctxRoot, 'state', 'daemon-self-restart.json'),
+      JSON.stringify({ ts: now - 60_000, reason: 'previous', staleAgents: ['alice:primary'] }),
+    );
+    (am as any).agents.set('alice', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness(),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it('tracks both primary and activity pollers when calculating the stale threshold', async () => {
+    (am as any).agents.set('aurex', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness(),
+      activityPollerLiveness: staleLiveness(),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('does not count stopped agents as active Telegram pollers', async () => {
+    (am as any).agents.set('alice', {
+      process: stoppedProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness(),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).not.toHaveBeenCalled();
   });
 });

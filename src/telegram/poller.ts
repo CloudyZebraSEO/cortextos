@@ -1,8 +1,8 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery, TelegramMessageReaction } from '../types/index.js';
 import { TelegramAPI } from './api.js';
-import { ensureDir } from '../utils/atomic.js';
+import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 
 export type MessageHandler = (msg: TelegramMessage) => void | Promise<void>;
 export type CallbackHandler = (query: TelegramCallbackQuery) => void | Promise<void>;
@@ -14,6 +14,16 @@ const BATCH_LIMIT = 100;
 // until an update arrives or this elapses. Client abort is set to
 // (timeout * 1000) + 5000 ms by TelegramAPI.getUpdates.
 const LONG_POLL_TIMEOUT_SECONDS = 25;
+export const BACKOFF_CAP_MS = 30_000;
+export const LOG_SUMMARY_MS = 120_000;
+export const ESCALATE_AFTER_MS = 120_000;
+
+export type TelegramPollerExitReason =
+  | ''
+  | 'stopped-externally'
+  | 'conflict-self-die'
+  | 'poll-stuck'
+  | 'auth-failed';
 
 /**
  * Telegram polling loop. Replaces the Telegram portion of fast-checker.sh.
@@ -39,7 +49,8 @@ export class TelegramPoller {
    *     retake the lock instead of hot-looping on Conflict.
    *   - '' : loop still running / never exited.
    */
-  lastExitReason: string = '';
+  lastExitReason: TelegramPollerExitReason = '';
+  onApiSuccess?: () => void;
 
   /**
    * @param api Telegram API client scoped to a single bot token.
@@ -100,10 +111,21 @@ export class TelegramPoller {
   async start(): Promise<void> {
     this.running = true;
     this.lastExitReason = '';
+    let consecutiveFailures = 0;
+    let firstFailureAt = 0;
+    let lastSummaryLogAt = 0;
+
     while (this.running) {
       let backoffMs = 0;
       try {
         const hadUpdate = await this.pollOnce();
+        if (consecutiveFailures > 0) {
+          const elapsed = Date.now() - firstFailureAt;
+          console.error(`[telegram-poller] recovered after ${consecutiveFailures} failure(s) over ${Math.round(elapsed / 1000)}s`);
+          consecutiveFailures = 0;
+          firstFailureAt = 0;
+          lastSummaryLogAt = 0;
+        }
         if (!hadUpdate) backoffMs = 100;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -116,9 +138,32 @@ export class TelegramPoller {
           this.running = false;
           return;
         }
-        // Other errors are transient — log and continue polling.
-        console.error('[telegram-poller] Poll error:', err);
-        backoffMs = 1000;
+        if (isPermanentAuthError(msg)) {
+          this.lastExitReason = 'auth-failed';
+          this.running = false;
+          console.error('[telegram-poller] permanent Telegram auth error; exiting poll loop:', err);
+          return;
+        }
+
+        const now = Date.now();
+        if (consecutiveFailures === 0) {
+          firstFailureAt = now;
+          lastSummaryLogAt = now;
+          console.error('[telegram-poller] Poll error:', err);
+        } else if (now - lastSummaryLogAt >= LOG_SUMMARY_MS) {
+          lastSummaryLogAt = now;
+          console.error(
+            `[telegram-poller] poll still failing after ${consecutiveFailures + 1} failure(s) over ${Math.round((now - firstFailureAt) / 1000)}s: ${msg}`,
+          );
+        }
+        if (now - firstFailureAt >= ESCALATE_AFTER_MS) {
+          this.lastExitReason = 'poll-stuck';
+          this.running = false;
+          return;
+        }
+
+        backoffMs = Math.min(1000 * (2 ** consecutiveFailures), BACKOFF_CAP_MS);
+        consecutiveFailures += 1;
       }
       if (backoffMs > 0) await sleep(backoffMs);
     }
@@ -145,6 +190,7 @@ export class TelegramPoller {
    */
   async pollOnce(): Promise<boolean> {
     const result = await this.api.getUpdates(this.offset, BATCH_LIMIT, LONG_POLL_TIMEOUT_SECONDS);
+    this.onApiSuccess?.();
     if (!result?.result?.length) return false;
 
     for (const update of result.result as TelegramUpdate[]) {
@@ -224,11 +270,15 @@ export class TelegramPoller {
     ensureDir(this.stateDir);
     const offsetFile = join(this.stateDir, this.offsetFileName);
     try {
-      writeFileSync(offsetFile, String(this.offset), 'utf-8');
+      atomicWriteSync(offsetFile, String(this.offset));
     } catch {
       // Ignore write errors
     }
   }
+}
+
+function isPermanentAuthError(message: string): boolean {
+  return /\b(401|404)\b|Unauthorized|Not Found/i.test(message);
 }
 
 function sleep(ms: number): Promise<void> {
