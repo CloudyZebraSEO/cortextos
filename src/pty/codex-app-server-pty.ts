@@ -186,7 +186,17 @@ export class CodexAppServerPTY {
   write(data: string): void {
     if (!this._alive) return;
 
-    if (data === '\r') {
+    // Submit on a real submit sequence. Historically this was a lone CR (\r,
+    // KEYS.ENTER). injectMessage now sends CRLF (\r\n) — the fix for the
+    // claude-code idle-prompt swallow (an idle prompt echoes a bracketed paste
+    // but ignores a lone CR). This runtime intercepts writes, so it must treat
+    // CRLF as a submit too; otherwise \r\n falls through to the buffer and the
+    // injected message wedges, never reaching handleInput.
+    // Match ONLY \r and \r\n — never a bare \n: a large chunked paste can end a
+    // content slice on a lone \n and we must not submit mid-paste. If a transport
+    // ever split \r\n into \r then \n, the \r still submits and the trim() below
+    // absorbs the orphan \n on the next submit.
+    if (data === '\r' || data === '\r\n') {
       const content = this._writeBuffer
         .replace(/\x1b\[200~/g, '')
         .replace(/\x1b\[201~/g, '')
