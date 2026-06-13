@@ -12,6 +12,10 @@ function createMockAgent(name = 'test-agent') {
   return {
     name,
     isBootstrapped: vi.fn().mockReturnValue(true),
+    getConfig: vi.fn().mockReturnValue({}),
+    getAgentDir: vi.fn().mockReturnValue(join(tmpdir(), 'mock-agent-dir')),
+    getSessionStartTime: vi.fn().mockReturnValue(Date.now() - 60_000),
+    injectMessageDetailed: vi.fn().mockReturnValue({ ok: true }),
     injectMessage: vi.fn().mockReturnValue(true),
     write: vi.fn(),
   } as any;
@@ -60,6 +64,19 @@ function createTestPaths(testDir: string): BusPaths {
     }
   }
   return paths;
+}
+
+function writeInboxMessage(paths: BusPaths, id: string, text = 'hello from inbox'): void {
+  const message = {
+    id,
+    from: 'atlas',
+    to: 'test-agent',
+    priority: 'normal',
+    timestamp: '2026-06-13T00:00:00.000Z',
+    text,
+    reply_to: null,
+  };
+  writeFileSync(join(paths.inbox, `2-1781320000000-from-atlas-${id}.json`), JSON.stringify(message));
 }
 
 describe('FastChecker', () => {
@@ -316,6 +333,112 @@ describe('FastChecker', () => {
       const sendTyping = (checker as any).sendTyping.bind(checker);
       // Should not throw
       await expect(sendTyping(api, '12345')).resolves.toBeUndefined();
+    });
+  });
+
+  describe('pollCycle inbound injection reliability', () => {
+    it('re-queues Telegram messages to the front on NOT_RUNNING and delivers them on the next idle cycle', async () => {
+      const agent = createMockAgent();
+      agent.injectMessageDetailed
+        .mockReturnValueOnce({ ok: false, code: 'NOT_RUNNING', message: 'agent stopped' })
+        .mockReturnValueOnce({ ok: true });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('first\n');
+
+      await (checker as any).pollCycle();
+      expect((checker as any).telegramMessages.map((m: any) => m.formatted)).toEqual(['first\n']);
+
+      await (checker as any).pollCycle();
+      expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(2);
+      expect(agent.injectMessageDetailed.mock.calls[1][0]).toBe('first\n');
+      expect((checker as any).telegramMessages).toHaveLength(0);
+    });
+
+    it('drops DEDUPED inbound blocks without re-queueing', async () => {
+      const agent = createMockAgent();
+      agent.injectMessageDetailed.mockReturnValueOnce({
+        ok: false,
+        code: 'DEDUPED',
+        message: 'content matches MessageDedup hash window',
+      });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('dupe\n');
+
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
+      expect((checker as any).telegramMessages).toHaveLength(0);
+    });
+
+    it('holds queued Telegram messages while agent is active and delivers once idle', async () => {
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('held\n');
+      (checker as any).lastMessageInjectedAt = Date.now();
+
+      await (checker as any).pollCycle();
+      expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
+      expect((checker as any).telegramMessages.map((m: any) => m.formatted)).toEqual(['held\n']);
+
+      writeFileSync(join(paths.stateDir, 'last_idle.flag'), String(Math.floor(Date.now() / 1000) + 1));
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
+      expect(agent.injectMessageDetailed.mock.calls[0][0]).toBe('held\n');
+      expect((checker as any).telegramMessages).toHaveLength(0);
+    });
+
+    it('does not move inbox messages to inflight while active; ACKs only after idle delivery', async () => {
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      writeInboxMessage(paths, 'msg1', 'deliver later');
+      (checker as any).lastMessageInjectedAt = Date.now();
+
+      await (checker as any).pollCycle();
+      expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
+      expect(existsSync(join(paths.inbox, '2-1781320000000-from-atlas-msg1.json'))).toBe(true);
+
+      writeFileSync(join(paths.stateDir, 'last_idle.flag'), String(Math.floor(Date.now() / 1000) + 1));
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
+      expect(agent.injectMessageDetailed.mock.calls[0][0]).toContain('deliver later');
+      expect(existsSync(join(paths.inbox, '2-1781320000000-from-atlas-msg1.json'))).toBe(false);
+      expect(existsSync(join(paths.processed, '2-1781320000000-from-atlas-msg1.json'))).toBe(true);
+    });
+
+    it('preserves FIFO ordering across NOT_RUNNING retry', async () => {
+      const agent = createMockAgent();
+      agent.injectMessageDetailed
+        .mockReturnValueOnce({ ok: false, code: 'NOT_RUNNING', message: 'agent stopped' })
+        .mockReturnValueOnce({ ok: true });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('one\n');
+      checker.queueTelegramMessage('two\n');
+
+      await (checker as any).pollCycle();
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed.mock.calls[1][0]).toBe('one\ntwo\n');
+    });
+
+    it('re-queues Telegram messages when injection throws and redelivers next cycle', async () => {
+      const agent = createMockAgent();
+      agent.injectMessageDetailed
+        .mockImplementationOnce(() => {
+          throw new Error('pty closed');
+        })
+        .mockReturnValueOnce({ ok: true });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('survive\n');
+
+      await (checker as any).pollCycle();
+      expect((checker as any).telegramMessages.map((m: any) => m.formatted)).toEqual(['survive\n']);
+
+      await (checker as any).pollCycle();
+      expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(2);
+      expect(agent.injectMessageDetailed.mock.calls[1][0]).toBe('survive\n');
+      expect((checker as any).telegramMessages).toHaveLength(0);
     });
   });
 

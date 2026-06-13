@@ -15,6 +15,11 @@ import { atomicWriteSync } from '../utils/atomic.js';
 
 type LogFn = (msg: string) => void;
 
+type PendingInboundMessage = { formatted: string; ackIds: string[] };
+type InjectResult = { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string };
+
+const HELD_INBOUND_ALERT_CYCLES = 60;
+
 /**
  * Fast message checker for a single agent.
  * Replaces fast-checker.sh: polls Telegram and inbox, injects into PTY.
@@ -39,6 +44,7 @@ export class FastChecker {
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
+  private heldInboundCycles: number = 0;
 
   // Persistent dedup: message hashes to prevent duplicate delivery
   private seenHashes: Set<string> = new Set();
@@ -173,39 +179,79 @@ export class FastChecker {
    * Single poll cycle: check inbox + queued Telegram messages.
    */
   private async pollCycle(): Promise<void> {
-    let messageBlock = '';
-    const ackIds: string[] = [];
+    const queuedTelegramCount = this.telegramMessages.length;
+    const pendingInboxCount = this.countPendingInboxMessages();
 
-    // Process queued Telegram messages
+    if ((queuedTelegramCount > 0 || pendingInboxCount > 0) && this.isAgentActive()) {
+      this.heldInboundCycles += 1;
+      if (this.heldInboundCycles === HELD_INBOUND_ALERT_CYCLES || this.heldInboundCycles % HELD_INBOUND_ALERT_CYCLES === 0) {
+        this.log(
+          `Holding inbound messages while agent is active (telegram=${queuedTelegramCount}, inbox=${pendingInboxCount}, held_cycles=${this.heldInboundCycles})`,
+        );
+      }
+      if (this.chatId && this.telegramApi) {
+        await this.sendTyping(this.telegramApi, this.chatId);
+      }
+      await this.checkContextStatus();
+      return;
+    }
+
+    this.heldInboundCycles = 0;
+    const inboxMessages = checkInbox(this.paths);
+
+    const pendingMessages: PendingInboundMessage[] = [];
     let hasTelegramMessage = false;
     while (this.telegramMessages.length > 0) {
       const msg = this.telegramMessages.shift()!;
-      messageBlock += msg.formatted;
+      pendingMessages.push(msg);
       hasTelegramMessage = true;
     }
 
-    // Check agent inbox
-    const inboxMessages = checkInbox(this.paths);
     for (const msg of inboxMessages) {
-      messageBlock += this.formatInboxMessage(msg);
-      ackIds.push(msg.id);
+      pendingMessages.push({
+        formatted: this.formatInboxMessage(msg),
+        ackIds: [msg.id],
+      });
     }
 
     // Inject if there's anything
-    if (messageBlock) {
-      const injected = this.agent.injectMessage(messageBlock);
-      if (injected) {
+    if (pendingMessages.length > 0) {
+      const messageBlock = pendingMessages.map(msg => msg.formatted).join('');
+      const ackIds = pendingMessages.flatMap(msg => msg.ackIds);
+      let injected: InjectResult;
+      try {
+        injected = this.injectInboundBlock(messageBlock);
+      } catch (err) {
+        injected = {
+          ok: false,
+          code: 'NOT_RUNNING',
+          message: `injection threw: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      if (injected.ok || injected.code === 'DEDUPED') {
         // ACK inbox messages
         for (const id of ackIds) {
           ackInbox(this.paths, id);
         }
-        this.log(`Injected ${messageBlock.length} bytes`);
+        this.log(
+          injected.ok
+            ? `Injected ${messageBlock.length} bytes`
+            : `Dropped deduped inbound block (${messageBlock.length} bytes): ${injected.message}`,
+        );
         // Only update typing timestamp for Telegram messages, not inbox/cron.
         // Inbox messages (agent-to-agent, session continuations) must not
         // restart the typing indicator after Stop has cleared it.
-        if (hasTelegramMessage) {
+        if (injected.ok && hasTelegramMessage) {
           this.lastMessageInjectedAt = Date.now();
         }
+      } else if (injected.code === 'NOT_RUNNING') {
+        const telegramToRequeue = pendingMessages.filter(msg => msg.ackIds.length === 0);
+        if (telegramToRequeue.length > 0) {
+          this.telegramMessages.unshift(...telegramToRequeue);
+        }
+        this.log(
+          `Inbound injection deferred; agent not running. Re-queued ${telegramToRequeue.length} Telegram message(s), left ${ackIds.length} inbox message(s) unacked: ${injected.message}`,
+        );
       }
     }
 
@@ -216,6 +262,24 @@ export class FastChecker {
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
     await this.checkContextStatus();
+  }
+
+  private injectInboundBlock(messageBlock: string): InjectResult {
+    const agentWithDetailed = this.agent as AgentProcess & {
+      injectMessageDetailed?: (content: string) => InjectResult;
+    };
+    if (typeof agentWithDetailed.injectMessageDetailed === 'function') {
+      return agentWithDetailed.injectMessageDetailed(messageBlock);
+    }
+    return this.agent.injectMessage(messageBlock) ? { ok: true } : { ok: false, code: 'NOT_RUNNING', message: 'legacy injectMessage returned false' };
+  }
+
+  private countPendingInboxMessages(): number {
+    try {
+      return readdirSync(this.paths.inbox).filter(f => f.endsWith('.json') && !f.startsWith('.')).length;
+    } catch {
+      return 0;
+    }
   }
 
   /**
