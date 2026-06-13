@@ -4,6 +4,7 @@ vi.mock('child_process', () => ({ execFile: vi.fn() }));
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { createHash } from 'crypto';
 import { FastChecker } from '../../../src/daemon/fast-checker';
 import type { BusPaths, TelegramCallbackQuery } from '../../../src/types';
 
@@ -439,6 +440,34 @@ describe('FastChecker', () => {
       expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(2);
       expect(agent.injectMessageDetailed.mock.calls[1][0]).toBe('survive\n');
       expect((checker as any).telegramMessages).toHaveLength(0);
+    });
+
+    it('passes delivery ids as the downstream injection dedup key', async () => {
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('repeat\n', 'telegram-update:9001');
+      await (checker as any).pollCycle();
+      writeFileSync(join(paths.stateDir, 'last_idle.flag'), String(Math.floor(Date.now() / 1000) + 1));
+      checker.queueTelegramMessage('repeat\n', 'telegram-update:9002');
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(2);
+      expect(agent.injectMessageDetailed.mock.calls[0][0]).toBe('repeat\n');
+      expect(agent.injectMessageDetailed.mock.calls[0][1]).toBe('telegram-update:9001');
+      expect(agent.injectMessageDetailed.mock.calls[1][0]).toBe('repeat\n');
+      expect(agent.injectMessageDetailed.mock.calls[1][1]).toBe('telegram-update:9002');
+    });
+
+    it('versions the persistent dedup store and ignores legacy content-hash entries', () => {
+      const legacyHash = createHash('sha256').update('telegram-update:9001').digest('hex');
+      const dedupPath = join(paths.stateDir, '.message-dedup-hashes');
+      writeFileSync(dedupPath, `${legacyHash}\n`, 'utf-8');
+
+      const checker = new FastChecker(createMockAgent(), paths, '/tmp/framework');
+
+      expect(checker.isDuplicate('telegram-update:9001')).toBe(false);
+      expect(checker.isDuplicate('telegram-update:9001')).toBe(true);
+      expect(readFileSync(dedupPath, 'utf-8')).toContain('cortextos-fastchecker-dedup:v2-delivery-id');
     });
   });
 

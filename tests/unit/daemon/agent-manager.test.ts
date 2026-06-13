@@ -1,8 +1,33 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { buildReplyContext } from '../../../src/daemon/agent-manager.js';
+
+const mockRuntime = vi.hoisted(() => ({
+  checkers: [] as Array<{
+    seen: Set<string>;
+    queued: string[];
+    callbacks: unknown[];
+    isDuplicate: (text: string) => boolean;
+    queueTelegramMessage: (formatted: string) => void;
+    handleCallback: (query: unknown) => Promise<void>;
+    start: () => Promise<void>;
+    stop: () => void;
+    wake: () => void;
+  }>,
+  pollers: [] as Array<{
+    lastExitReason: string;
+    messageHandler?: (msg: unknown, updateId: number) => void | Promise<void>;
+    callbackHandler?: (query: unknown, updateId: number) => void | Promise<void>;
+    reactionHandler?: (reaction: unknown, updateId: number) => void | Promise<void>;
+    onMessage: (handler: (msg: unknown, updateId: number) => void | Promise<void>) => void;
+    onCallback: (handler: (query: unknown, updateId: number) => void | Promise<void>) => void;
+    onReaction: (handler: (reaction: unknown, updateId: number) => void | Promise<void>) => void;
+    start: () => Promise<void>;
+    stop: () => void;
+  }>,
+}));
 
 // Mock the PTY layer so we don't load native bindings or spawn real processes.
 // AgentManager → AgentProcess → AgentPTY → node-pty. We mock at AgentProcess.
@@ -17,6 +42,8 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
     async start() { /* no-op */ }
     async stop() { /* no-op */ }
     getStatus() { return { name: this.name, status: 'stopped' }; }
+    setTelegramHandle() { /* no-op */ }
+    onStatusChanged() { /* no-op */ }
     onExit() { /* no-op */ }
   },
 }));
@@ -24,9 +51,35 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
 // Mock FastChecker so it doesn't try to spawn anything either.
 vi.mock('../../../src/daemon/fast-checker.js', () => ({
   FastChecker: class {
-    start() { /* no-op */ }
+    seen = new Set<string>();
+    queued: string[] = [];
+    callbacks: unknown[] = [];
+    constructor() {
+      mockRuntime.checkers.push(this);
+    }
+    isDuplicate(text: string) {
+      if (this.seen.has(text)) return true;
+      this.seen.add(text);
+      return false;
+    }
+    queueTelegramMessage(formatted: string) {
+      this.queued.push(formatted);
+    }
+    async handleCallback(query: unknown) {
+      this.callbacks.push(query);
+    }
+    async start() { /* no-op */ }
     stop() { /* no-op */ }
     wake() { /* no-op */ }
+    static formatTelegramTextMessage(_from: string, _chatId: string | number, text: string) {
+      return `TEXT:${text}\n`;
+    }
+    static readLastSent() {
+      return null;
+    }
+    static formatTelegramReaction(_from: string, _chatId: string | number, messageId: number, _oldReaction: unknown[], newReaction: unknown[]) {
+      return `REACTION:${messageId}:${JSON.stringify(newReaction)}\n`;
+    }
   },
 }));
 
@@ -34,14 +87,30 @@ vi.mock('../../../src/daemon/fast-checker.js', () => ({
 vi.mock('../../../src/telegram/api.js', () => ({
   TelegramAPI: class {
     constructor() { /* no-op */ }
+    sendMessage() { return Promise.resolve(); }
   },
 }));
 
 vi.mock('../../../src/telegram/poller.js', () => ({
   TelegramPoller: class {
-    start() { /* no-op */ }
+    lastExitReason = 'stopped-externally';
+    messageHandler?: (msg: unknown, updateId: number) => void | Promise<void>;
+    callbackHandler?: (query: unknown, updateId: number) => void | Promise<void>;
+    reactionHandler?: (reaction: unknown, updateId: number) => void | Promise<void>;
+    constructor() {
+      mockRuntime.pollers.push(this);
+    }
+    onMessage(handler: (msg: unknown, updateId: number) => void | Promise<void>) { this.messageHandler = handler; }
+    onCallback(handler: (query: unknown, updateId: number) => void | Promise<void>) { this.callbackHandler = handler; }
+    onReaction(handler: (reaction: unknown, updateId: number) => void | Promise<void>) { this.reactionHandler = handler; }
+    async start() { /* no-op */ }
     stop() { /* no-op */ }
   },
+}));
+
+vi.mock('../../../src/bus/metrics.js', () => ({
+  collectTelegramCommands: () => [],
+  registerTelegramCommands: () => Promise.resolve({ status: 'ok', count: 0, commands: [] }),
 }));
 
 const { AgentManager } = await import('../../../src/daemon/agent-manager.js');
@@ -284,6 +353,141 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(startSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentManager Telegram inbound delivery-id dedup', () => {
+  let testDir: string;
+  let instanceId: string;
+  let managerCtxRoot: string;
+  let ctxRootOnDisk: string;
+  let frameworkRoot: string;
+  let agentDir: string;
+  let am: InstanceType<typeof AgentManager>;
+
+  beforeEach(async () => {
+    mockRuntime.checkers.length = 0;
+    mockRuntime.pollers.length = 0;
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-delivery-dedup-'));
+    instanceId = `delivery-dedup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    managerCtxRoot = join(testDir, 'instance');
+    ctxRootOnDisk = join(homedir(), '.cortextos', instanceId);
+    frameworkRoot = join(testDir, 'framework');
+    agentDir = join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, '.env'),
+      [
+        'BOT_TOKEN=123456:ABCdef_123',
+        'CHAT_ID=100',
+        'ALLOWED_USER=42',
+        '',
+      ].join('\n'),
+    );
+    am = new AgentManager(instanceId, managerCtxRoot, frameworkRoot, 'acme');
+    await am.startAgent('alice', agentDir, { runtime: 'hermes' } as any, 'acme');
+  });
+
+  afterEach(async () => {
+    await am?.stopAgent('alice').catch(() => undefined);
+    rmSync(testDir, { recursive: true, force: true });
+    rmSync(ctxRootOnDisk, { recursive: true, force: true });
+  });
+
+  function message(messageId: number, text: string) {
+    return {
+      message_id: messageId,
+      from: { id: 42, first_name: 'Steven' },
+      chat: { id: 100 },
+      text,
+    };
+  }
+
+  function archiveLines(): string[] {
+    const archive = join(managerCtxRoot, 'logs', 'alice', 'inbound-messages.jsonl');
+    try {
+      return readFileSync(archive, 'utf-8').trim().split('\n').filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  it('delivers repeated identical text when Telegram message_id differs', async () => {
+    const poller = mockRuntime.pollers.at(-1)!;
+    const checker = mockRuntime.checkers.at(-1)!;
+
+    await poller.messageHandler!(message(2471, 'same text'), 9001);
+    await poller.messageHandler!(message(2472, 'same text'), 9002);
+
+    expect(checker.queued).toEqual(['TEXT:same text\n', 'TEXT:same text\n']);
+    expect(archiveLines()).toHaveLength(2);
+  });
+
+  it('dedupes a true Telegram redelivery with the same chat/message_id before archive', async () => {
+    const poller = mockRuntime.pollers.at(-1)!;
+    const checker = mockRuntime.checkers.at(-1)!;
+
+    await poller.messageHandler!(message(2471, 'approve v3'), 9001);
+    await poller.messageHandler!(message(2471, 'approve v3'), 9001);
+
+    expect(checker.queued).toEqual(['TEXT:approve v3\n']);
+    expect(archiveLines()).toHaveLength(1);
+  });
+
+  it('prefers update_id over chat/message_id when deriving Telegram delivery ids', async () => {
+    const poller = mockRuntime.pollers.at(-1)!;
+    const checker = mockRuntime.checkers.at(-1)!;
+
+    await poller.messageHandler!(message(2471, 'same message id'), 9001);
+    await poller.messageHandler!(message(2471, 'same message id'), 9002);
+
+    expect(checker.queued).toEqual(['TEXT:same message id\n', 'TEXT:same message id\n']);
+    expect(archiveLines()).toHaveLength(2);
+  });
+
+  it('does not content-drop repeated text after archiving it', async () => {
+    const poller = mockRuntime.pollers.at(-1)!;
+    const checker = mockRuntime.checkers.at(-1)!;
+
+    await poller.messageHandler!(message(2471, 'OK'), 9001);
+    await poller.messageHandler!(message(2472, 'OK'), 9002);
+
+    const archivedMessageIds = archiveLines().map(line => JSON.parse(line).message_id);
+    expect(archivedMessageIds).toEqual([2471, 2472]);
+    expect(checker.queued).toHaveLength(2);
+  });
+
+  it('dedupes callback and reaction redeliveries by update_id instead of formatted content', async () => {
+    const poller = mockRuntime.pollers.at(-1)!;
+    const checker = mockRuntime.checkers.at(-1)!;
+
+    await poller.callbackHandler!({ id: 'cb-1', from: { id: 42, first_name: 'Steven' }, data: 'approve' }, 9100);
+    await poller.callbackHandler!({ id: 'cb-1', from: { id: 42, first_name: 'Steven' }, data: 'approve' }, 9100);
+    await poller.reactionHandler!(
+      {
+        chat: { id: 100 },
+        user: { id: 42, first_name: 'Steven' },
+        message_id: 55,
+        date: 1,
+        old_reaction: [],
+        new_reaction: [{ type: 'emoji', emoji: '👍' }],
+      },
+      9101,
+    );
+    await poller.reactionHandler!(
+      {
+        chat: { id: 100 },
+        user: { id: 42, first_name: 'Steven' },
+        message_id: 55,
+        date: 1,
+        old_reaction: [],
+        new_reaction: [{ type: 'emoji', emoji: '👍' }],
+      },
+      9101,
+    );
+
+    expect(checker.callbacks).toHaveLength(1);
+    expect(checker.queued).toHaveLength(1);
   });
 });
 

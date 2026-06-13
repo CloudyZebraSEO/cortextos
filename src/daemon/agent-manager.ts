@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { join, relative } from 'path';
-import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
+import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramCallbackQuery, TelegramMessage, TelegramMessageReaction } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
@@ -622,7 +622,7 @@ export class AgentManager {
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
-      currentPoller.onMessage(async (msg) => {
+      currentPoller.onMessage(async (msg, updateId) => {
         // ALLOWED_USER gate: comma-separated list of numeric user IDs.
         // If configured, ignore messages from other users. Always log the
         // rejected user_id + name so operators can discover IDs to whitelist.
@@ -661,6 +661,12 @@ export class AgentManager {
         const msgChatId = msg.chat?.id;
         const effectiveChatId = msgChatId ?? chatId ?? '';
         const stateDir = join(this.ctxRoot, 'state', name);
+        const deliveryKey = telegramMessageDeliveryKey(msg, updateId);
+
+        if (checker.isDuplicate(deliveryKey)) {
+          log(`Duplicate Telegram delivery suppressed (${deliveryKey})`);
+          return;
+        }
 
         // Persist the inbound message to JSONL AND emit a
         // `message/telegram_received` bus event in one helper so
@@ -682,7 +688,7 @@ export class AgentManager {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
               const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
-              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+              checker.queueTelegramMessage(formatted, deliveryKey);
               return;
             }
 
@@ -709,17 +715,13 @@ export class AgentManager {
               formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration);
             }
 
-            if (checker.isDuplicate(formatted)) {
-              log('Duplicate Telegram media message suppressed');
-              return;
-            }
             log(`Media message received: type=${media.type}, path=${media.image_path || media.file_path}`);
-            checker.queueTelegramMessage(formatted);
+            checker.queueTelegramMessage(formatted, deliveryKey);
           } catch (err) {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
             const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
-            if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+            checker.queueTelegramMessage(formatted, deliveryKey);
           }
           return;
         }
@@ -741,22 +743,23 @@ export class AgentManager {
           recentHistory,
         );
 
-        if (checker.isDuplicate(formatted)) {
-          log('Duplicate Telegram message suppressed');
-          return;
-        }
-        checker.queueTelegramMessage(formatted);
+        checker.queueTelegramMessage(formatted, deliveryKey);
       });
 
-      currentPoller.onCallback((query) => {
+      currentPoller.onCallback((query, updateId) => {
+        const callbackKey = telegramCallbackDeliveryKey(query, updateId);
+        if (checker.isDuplicate(callbackKey)) {
+          log(`Duplicate Telegram callback suppressed (${callbackKey})`);
+          return;
+        }
         // Route to fast-checker for hook response handling (perm_allow/deny, askopt, etc.)
         // handleCallback writes hook-response files and edits Telegram messages
-        checker.handleCallback(query).catch(err => {
+        checker.handleCallback(query, callbackKey).catch(err => {
           log(`Callback handling error: ${err}`);
         });
       });
 
-      currentPoller.onReaction((reaction) => {
+      currentPoller.onReaction((reaction, updateId) => {
         // ALLOWED_USER gate: same multi-user rule as message handler.
         if (allowedUserId) {
           const allowedIds = allowedUserId.split(',').map((s) => parseInt(s.trim(), 10));
@@ -786,6 +789,11 @@ export class AgentManager {
 
         const agentEntry = this.agents.get(name);
         if (agentEntry) agentEntry.telegramRejectCount = 0;
+        const reactionKey = telegramReactionDeliveryKey(reaction, updateId);
+        if (checker.isDuplicate(reactionKey)) {
+          log(`Duplicate Telegram reaction suppressed (${reactionKey})`);
+          return;
+        }
 
         const from = stripControlChars(reaction.user?.first_name || reaction.user?.username || 'Unknown');
         const reactionChatId = reaction.chat?.id ?? chatId ?? '';
@@ -796,11 +804,7 @@ export class AgentManager {
           reaction.old_reaction ?? [],
           reaction.new_reaction ?? [],
         );
-        if (checker.isDuplicate(formatted)) {
-          log('Duplicate Telegram reaction suppressed');
-          return;
-        }
-        checker.queueTelegramMessage(formatted);
+        checker.queueTelegramMessage(formatted, reactionKey);
       });
 
       // Wrap poller.start() in a restart loop. Tier 1 exits on bounded
@@ -1466,4 +1470,17 @@ export function buildReplyContext(
   if (replyMsg.audio) return '[audio]';
   if (replyMsg.document) return `[document: ${replyMsg.document.file_name ?? 'file'}]`;
   return undefined;
+}
+
+function telegramMessageDeliveryKey(msg: TelegramMessage, updateId?: number): string {
+  if (typeof updateId === 'number') return `telegram-update:${updateId}`;
+  return `telegram-message:${String(msg.chat?.id ?? '')}:${msg.message_id}`;
+}
+
+function telegramCallbackDeliveryKey(query: TelegramCallbackQuery, updateId: number): string {
+  return `telegram-callback:${updateId}:${query.id}`;
+}
+
+function telegramReactionDeliveryKey(reaction: TelegramMessageReaction, updateId: number): string {
+  return `telegram-reaction:${updateId}:${String(reaction.chat?.id ?? '')}:${reaction.message_id}`;
 }

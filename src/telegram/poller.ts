@@ -4,9 +4,9 @@ import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery, TelegramMe
 import { TelegramAPI } from './api.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 
-export type MessageHandler = (msg: TelegramMessage) => void | Promise<void>;
-export type CallbackHandler = (query: TelegramCallbackQuery) => void | Promise<void>;
-export type ReactionHandler = (reaction: TelegramMessageReaction) => void | Promise<void>;
+export type MessageHandler = (msg: TelegramMessage, updateId: number) => void | Promise<void>;
+export type CallbackHandler = (query: TelegramCallbackQuery, updateId: number) => void | Promise<void>;
+export type ReactionHandler = (reaction: TelegramMessageReaction, updateId: number) => void | Promise<void>;
 
 // Max updates returned per getUpdates batch. Telegram caps at 100.
 const BATCH_LIMIT = 100;
@@ -200,7 +200,7 @@ export class TelegramPoller {
       if (update.message) {
         for (const handler of this.messageHandlers) {
           try {
-            await handler(update.message);
+            await handler(update.message, update.update_id);
           } catch (err) {
             console.error('[telegram-poller] Message handler error:', err);
             handlerFailed = true;
@@ -212,7 +212,7 @@ export class TelegramPoller {
       if (!handlerFailed && update.callback_query) {
         for (const handler of this.callbackHandlers) {
           try {
-            await handler(update.callback_query);
+            await handler(update.callback_query, update.update_id);
           } catch (err) {
             console.error('[telegram-poller] Callback handler error:', err);
             handlerFailed = true;
@@ -224,7 +224,7 @@ export class TelegramPoller {
       if (!handlerFailed && update.message_reaction) {
         for (const handler of this.reactionHandlers) {
           try {
-            await handler(update.message_reaction);
+            await handler(update.message_reaction, update.update_id);
           } catch (err) {
             console.error('[telegram-poller] Reaction handler error:', err);
             handlerFailed = true;

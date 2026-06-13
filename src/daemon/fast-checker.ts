@@ -15,10 +15,11 @@ import { atomicWriteSync } from '../utils/atomic.js';
 
 type LogFn = (msg: string) => void;
 
-type PendingInboundMessage = { formatted: string; ackIds: string[] };
+type PendingInboundMessage = { formatted: string; ackIds: string[]; dedupKey?: string };
 type InjectResult = { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string };
 
 const HELD_INBOUND_ALERT_CYCLES = 60;
+const DEDUP_STORE_VERSION = '# cortextos-fastchecker-dedup:v2-delivery-id';
 
 /**
  * Fast message checker for a single agent.
@@ -43,7 +44,7 @@ export class FastChecker {
   private allowedUserId?: number;
 
   // External Telegram handler (set by daemon)
-  private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
+  private telegramMessages: Array<{ formatted: string; ackIds: string[]; dedupKey?: string }> = [];
   private heldInboundCycles: number = 0;
 
   // Persistent dedup: message hashes to prevent duplicate delivery
@@ -171,8 +172,8 @@ export class FastChecker {
    * Queue a formatted Telegram message for injection.
    * Called by the daemon's Telegram handler.
    */
-  queueTelegramMessage(formatted: string): void {
-    this.telegramMessages.push({ formatted, ackIds: [] });
+  queueTelegramMessage(formatted: string, dedupKey?: string): void {
+    this.telegramMessages.push({ formatted, ackIds: [], dedupKey });
   }
 
   /**
@@ -211,6 +212,7 @@ export class FastChecker {
       pendingMessages.push({
         formatted: this.formatInboxMessage(msg),
         ackIds: [msg.id],
+        dedupKey: `inbox-message:${msg.id}`,
       });
     }
 
@@ -218,9 +220,10 @@ export class FastChecker {
     if (pendingMessages.length > 0) {
       const messageBlock = pendingMessages.map(msg => msg.formatted).join('');
       const ackIds = pendingMessages.flatMap(msg => msg.ackIds);
+      const injectDedupKey = pendingMessages.map(msg => msg.dedupKey ?? `content:${msg.formatted}`).join('\n');
       let injected: InjectResult;
       try {
-        injected = this.injectInboundBlock(messageBlock);
+        injected = this.injectInboundBlock(messageBlock, injectDedupKey);
       } catch (err) {
         injected = {
           ok: false,
@@ -264,12 +267,12 @@ export class FastChecker {
     await this.checkContextStatus();
   }
 
-  private injectInboundBlock(messageBlock: string): InjectResult {
+  private injectInboundBlock(messageBlock: string, dedupKey: string): InjectResult {
     const agentWithDetailed = this.agent as AgentProcess & {
-      injectMessageDetailed?: (content: string) => InjectResult;
+      injectMessageDetailed?: (content: string, dedupKey?: string) => InjectResult;
     };
     if (typeof agentWithDetailed.injectMessageDetailed === 'function') {
-      return agentWithDetailed.injectMessageDetailed(messageBlock);
+      return agentWithDetailed.injectMessageDetailed(messageBlock, dedupKey);
     }
     return this.agent.injectMessage(messageBlock) ? { ok: true } : { ok: false, code: 'NOT_RUNNING', message: 'legacy injectMessage returned false' };
   }
@@ -621,7 +624,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
    * Handle a Telegram inline button callback query.
    * Routes to permission, restart, or AskUserQuestion handlers.
    */
-  async handleCallback(query: TelegramCallbackQuery): Promise<void> {
+  async handleCallback(query: TelegramCallbackQuery, dedupKey?: string): Promise<void> {
     const data = stripControlChars(query.data || '');
     const chatId = query.message?.chat?.id;
     const messageId = query.message?.message_id;
@@ -865,7 +868,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         `message_id: ${messageId}`,
         `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`,
       ].join('\n');
-      const injected = this.agent.injectMessage(msg);
+      const injected = this.agent.injectMessageDetailed(msg, dedupKey).ok;
       if (injected && this.telegramApi) {
         try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Got it'); } catch { /* ignore */ }
       }
@@ -1234,7 +1237,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     try {
       if (existsSync(this.dedupFilePath)) {
         const content = readFileSync(this.dedupFilePath, 'utf-8');
-        const hashes = content.trim().split('\n').filter(Boolean);
+        const lines = content.trim().split('\n').filter(Boolean);
+        if (lines[0] !== DEDUP_STORE_VERSION) {
+          this.seenHashes = new Set();
+          this.saveDedupHashes();
+          return;
+        }
+        const hashes = lines.slice(1);
         // Keep only last 1000 hashes to prevent file bloat
         const recent = hashes.slice(-1000);
         this.seenHashes = new Set(recent);
@@ -1251,7 +1260,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
   private saveDedupHashes(): void {
     try {
       const hashes = Array.from(this.seenHashes).slice(-1000);
-      writeFileSync(this.dedupFilePath, hashes.join('\n') + '\n', 'utf-8');
+      writeFileSync(this.dedupFilePath, [DEDUP_STORE_VERSION, ...hashes].join('\n') + '\n', 'utf-8');
     } catch {
       // Non-critical - dedup will still work in memory
     }
