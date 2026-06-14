@@ -15,11 +15,37 @@ import { atomicWriteSync } from '../utils/atomic.js';
 
 type LogFn = (msg: string) => void;
 
-type PendingInboundMessage = { formatted: string; ackIds: string[]; dedupKey?: string };
+type PendingInboundMessage = { formatted: string; ackIds: string[]; dedupKey?: string; pid?: string };
 type InjectResult = { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string };
 
 const HELD_INBOUND_ALERT_CYCLES = 60;
 const DEDUP_STORE_VERSION = '# cortextos-fastchecker-dedup:v2-delivery-id';
+
+/**
+ * Decide what a poll cycle should do with pending inbound, given whether the agent is
+ * mid-turn. Pure + exported for unit testing.
+ *
+ * Interrupt-bypass policy: a queued Telegram message has already passed the ALLOWED_USER
+ * gate, so it is a direct message FROM THE USER and must not wait a full turn — it jumps the
+ * active-turn hold. Agent-to-agent (inbox) messages and crons are background traffic; they
+ * still wait until the turn ends, and even when we proceed for a user interrupt mid-turn we
+ * inject ONLY the Telegram message(s), leaving inbox queued so background traffic never
+ * preempts the user's live turn.
+ */
+export function planInboundCycle(
+  agentActive: boolean,
+  telegramCount: number,
+  inboxCount: number,
+): { hold: boolean; injectInbox: boolean } {
+  const telegramInterrupt = telegramCount > 0;
+  // Mid-turn with only background traffic pending → hold it until the turn ends.
+  if (agentActive && !telegramInterrupt && inboxCount > 0) {
+    return { hold: true, injectInbox: false };
+  }
+  // Otherwise proceed. Pull inbox into this injection only when the agent is idle; if we are
+  // proceeding mid-turn it is because of a user Telegram interrupt → Telegram only.
+  return { hold: false, injectInbox: !agentActive };
+}
 
 /**
  * Fast message checker for a single agent.
@@ -44,7 +70,15 @@ export class FastChecker {
   private allowedUserId?: number;
 
   // External Telegram handler (set by daemon)
-  private telegramMessages: Array<{ formatted: string; ackIds: string[]; dedupKey?: string }> = [];
+  // Each entry carries a stable `pid` so the durable on-disk mirror (.pending-telegram.jsonl)
+  // can be reconciled precisely after injection. Telegram messages are acked to Telegram
+  // (offset advanced) and archived at queue-time by the daemon handler, so this queue MUST
+  // survive a daemon/PTY restart or the message is lost forever (no Telegram redelivery).
+  private telegramMessages: Array<{ formatted: string; ackIds: string[]; dedupKey?: string; pid?: string }> = [];
+  private pendingTgFilePath: string = '';
+  private pendingTgSeq: number = 0;
+  // Authoritative in-memory mirror of the durable file (pid -> entry); flushed atomically.
+  private pendingTgDurable: Map<string, { formatted: string; dedupKey?: string }> = new Map();
   private heldInboundCycles: number = 0;
 
   // Persistent dedup: message hashes to prevent duplicate delivery
@@ -91,6 +125,83 @@ export class FastChecker {
     // Load persisted circuit breaker state so --continue restarts don't reset it
     this.ctxCircuitFile = join(paths.stateDir, '.ctx-circuit.json');
     this.loadCtxCircuit();
+
+    // Durable mirror of the in-memory Telegram queue. Telegram messages are acked
+    // (offset advanced) at queue-time, so any that were queued-but-not-yet-injected when
+    // the process last stopped must be re-loaded here or they are lost permanently.
+    this.pendingTgFilePath = join(paths.stateDir, '.pending-telegram.jsonl');
+    this.loadPendingTelegram();
+  }
+
+  /**
+   * Reload any Telegram messages that were persisted but not yet injected before the last
+   * stop/restart, into both the durable map and the in-memory inject queue.
+   *
+   * Re-injection is safe: the PTY dedup (AgentProcess.dedup) is in-memory and resets on
+   * restart, so a recovered message injects cleanly on a fresh session. Within a single
+   * session, a DEDUPED result means the identical block was already written to this PTY
+   * moments ago (real delivery), so clearing on DEDUPED is sound. The deliberate trade-off
+   * of this design is no-loss over no-duplicate: a crash in the narrow window between a
+   * successful inject and the clear may re-deliver a message once on restart — acceptable,
+   * since the bug being fixed silently LOST messages.
+   */
+  private loadPendingTelegram(): void {
+    try {
+      if (!existsSync(this.pendingTgFilePath)) return;
+      const lines = readFileSync(this.pendingTgFilePath, 'utf8').split('\n').filter(l => l.trim());
+      let maxSeq = 0;
+      for (const line of lines) {
+        try {
+          const e = JSON.parse(line) as { pid: string; formatted: string; dedupKey?: string };
+          if (!e.pid || typeof e.formatted !== 'string') continue;
+          this.pendingTgDurable.set(e.pid, { formatted: e.formatted, dedupKey: e.dedupKey });
+          this.telegramMessages.push({ formatted: e.formatted, ackIds: [], dedupKey: e.dedupKey, pid: e.pid });
+          const n = parseInt(e.pid.split('-').pop() || '0', 10);
+          if (Number.isFinite(n) && n > maxSeq) maxSeq = n;
+        } catch { /* skip a single malformed line; whole-file atomic writes make this rare */ }
+      }
+      this.pendingTgSeq = maxSeq;
+      if (this.telegramMessages.length > 0) {
+        this.log(`Recovered ${this.telegramMessages.length} pending Telegram message(s) from durable queue`);
+      }
+    } catch (err) {
+      this.log(`Failed to load pending Telegram queue: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Rewrite the durable mirror from the in-memory map with an ATOMIC whole-file write
+   * (temp + rename) — no torn-append corruption. Returns false if the write failed, so the
+   * caller can fail loud: a swallowed persist failure is the one remaining way to lose a
+   * message that has already been acked upstream.
+   */
+  private flushPendingTelegram(): boolean {
+    try {
+      if (this.pendingTgDurable.size === 0) {
+        if (existsSync(this.pendingTgFilePath)) { try { unlinkSync(this.pendingTgFilePath); } catch { atomicWriteSync(this.pendingTgFilePath, ''); } }
+        return true;
+      }
+      const body = [...this.pendingTgDurable.entries()].map(([pid, e]) => JSON.stringify({ pid, formatted: e.formatted, dedupKey: e.dedupKey })).join('\n') + '\n';
+      atomicWriteSync(this.pendingTgFilePath, body);
+      return true;
+    } catch (err) {
+      this.log(`CRITICAL: failed to persist pending Telegram queue — a message may be lost on restart: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  /** Add one entry to the durable mirror and flush atomically. Returns persistence success. */
+  private persistPendingTelegram(entry: { pid: string; formatted: string; dedupKey?: string }): boolean {
+    this.pendingTgDurable.set(entry.pid, { formatted: entry.formatted, dedupKey: entry.dedupKey });
+    return this.flushPendingTelegram();
+  }
+
+  /** Remove the given pids from the durable mirror (after successful inject) and flush. */
+  private clearPendingTelegram(pids: string[]): void {
+    if (pids.length === 0) return;
+    let changed = false;
+    for (const pid of pids) { if (this.pendingTgDurable.delete(pid)) changed = true; }
+    if (changed) this.flushPendingTelegram();
   }
 
   /**
@@ -172,8 +283,17 @@ export class FastChecker {
    * Queue a formatted Telegram message for injection.
    * Called by the daemon's Telegram handler.
    */
-  queueTelegramMessage(formatted: string, dedupKey?: string): void {
-    this.telegramMessages.push({ formatted, ackIds: [], dedupKey });
+  queueTelegramMessage(formatted: string, dedupKey?: string): boolean {
+    // Stable pid = monotonic seq; the durable mirror lets a restart re-inject this message
+    // even though the daemon has already advanced the Telegram offset past it.
+    const pid = `tg-${++this.pendingTgSeq}`;
+    const persisted = this.persistPendingTelegram({ pid, formatted, dedupKey });
+    // Always enqueue in memory so the running process still injects (best effort). If the
+    // durable write failed, the only residual loss window is a crash before injection on
+    // THIS run — logged CRITICAL above. The full fail-closed path (persist before the
+    // upstream offset/archive ack) is tracked as a follow-up.
+    this.telegramMessages.push({ formatted, ackIds: [], dedupKey, pid });
+    return persisted;
   }
 
   /**
@@ -183,11 +303,15 @@ export class FastChecker {
     const queuedTelegramCount = this.telegramMessages.length;
     const pendingInboxCount = this.countPendingInboxMessages();
 
-    if ((queuedTelegramCount > 0 || pendingInboxCount > 0) && this.isAgentActive()) {
+    const agentActive = this.isAgentActive();
+    const plan = planInboundCycle(agentActive, queuedTelegramCount, pendingInboxCount);
+
+    if (plan.hold) {
+      // Only background (inbox/cron) traffic is pending while the agent is mid-turn — hold it.
       this.heldInboundCycles += 1;
       if (this.heldInboundCycles === HELD_INBOUND_ALERT_CYCLES || this.heldInboundCycles % HELD_INBOUND_ALERT_CYCLES === 0) {
         this.log(
-          `Holding inbound messages while agent is active (telegram=${queuedTelegramCount}, inbox=${pendingInboxCount}, held_cycles=${this.heldInboundCycles})`,
+          `Holding inbound (inbox) messages while agent is active (inbox=${pendingInboxCount}, held_cycles=${this.heldInboundCycles})`,
         );
       }
       if (this.chatId && this.telegramApi) {
@@ -198,7 +322,11 @@ export class FastChecker {
     }
 
     this.heldInboundCycles = 0;
-    const inboxMessages = checkInbox(this.paths);
+
+    // Pull inbox into this injection only when the plan allows it (agent idle). When we are
+    // proceeding mid-turn for a user Telegram interrupt, inbox/cron stays queued (held, not
+    // dropped) so background traffic never preempts the user's live turn.
+    const inboxMessages = plan.injectInbox ? checkInbox(this.paths) : [];
 
     const pendingMessages: PendingInboundMessage[] = [];
     let hasTelegramMessage = false;
@@ -236,6 +364,9 @@ export class FastChecker {
         for (const id of ackIds) {
           ackInbox(this.paths, id);
         }
+        // Telegram messages are now durably delivered to the PTY — drop them from the
+        // durable mirror so they are not re-injected on the next restart.
+        this.clearPendingTelegram(pendingMessages.filter(m => m.pid).map(m => m.pid!));
         this.log(
           injected.ok
             ? `Injected ${messageBlock.length} bytes`
