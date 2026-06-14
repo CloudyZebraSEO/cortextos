@@ -60,3 +60,39 @@ describe('AgentPTY --dangerously-skip-permissions toggle', () => {
     }
   });
 });
+
+describe('AgentPTY write-guard (inject-vs-teardown race)', () => {
+  function makeFakePty(writes: string[]) {
+    return {
+      pid: 1,
+      write: (d: string) => { writes.push(d); },
+      onData: () => ({ dispose() {} }),
+      onExit: () => ({ dispose() {} }),
+      kill: () => {},
+      resize: () => {},
+    };
+  }
+
+  it('write() delivers while alive, then no-ops after kill() sets the killing guard', () => {
+    const writes: string[] = [];
+    const pty = new AgentPTY(mockEnv, {});
+    // Inject a fake live PTY without going through the native spawn.
+    (pty as any).pty = makeFakePty(writes);
+    (pty as any)._alive = true;
+
+    pty.write('alive');
+    expect(writes).toEqual(['alive']);
+
+    pty.kill();
+    expect((pty as any).killing).toBe(true);
+
+    // A write racing the teardown must be dropped, not thrown.
+    expect(() => pty.write('after-kill')).not.toThrow();
+    expect(writes).toEqual(['alive']); // 'after-kill' dropped
+  });
+
+  it('write() no-ops (does not throw) when there is no PTY', () => {
+    const pty = new AgentPTY(mockEnv, {});
+    expect(() => pty.write('no-pty')).not.toThrow();
+  });
+});

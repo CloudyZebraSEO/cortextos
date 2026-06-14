@@ -863,19 +863,28 @@ export class CodexAppServerPTY {
    * into the context_status.json shape consumed by the FastChecker context
    * monitor. Writes atomically; failures are non-fatal (observability only).
    *
-   * Mapping (per codex schema ThreadTokenUsageUpdatedNotification):
-   *   - used_percentage = total.totalTokens / cap * 100  (clamped to [0, 100])
+   * Mapping (per codex schema ThreadTokenUsageUpdatedNotification → ThreadTokenUsage):
+   *   - used_percentage = last.totalTokens / cap * 100  (clamped to [0, 100])
    *   - context_window_size = modelContextWindow ?? config.codex_context_cap ?? 256000
-   *   - exceeds_200k_tokens = total.totalTokens > 200000
-   *   - current_usage.{input,output,cache_read} from total.{input,output,cachedInput}Tokens
+   *   - exceeds_200k_tokens = last.totalTokens > 200000
+   *   - current_usage.{input,output,cache_read} from last.{input,output,cachedInput}Tokens
    *   - session_id = current threadId
+   *
+   * CRITICAL (codex-halt-rootcause.md, Fix A): use `tokenUsage.last` — the
+   * most-recent turn's breakdown, which reflects the CURRENT context-window
+   * occupancy — NOT `tokenUsage.total`, which is CUMULATIVE lifetime tokens
+   * (climbs to 167M+ across a session) and pegged used_percentage at 100%
+   * forever, wedging codex's context monitor and blocking auto-handoff.
+   * The cumulative `total` still feeds appendCodexTokenLog() for cost reporting.
    */
   private writeContextStatus(params: Record<string, unknown>): void {
     const tokenUsage = isRecord(params.tokenUsage) ? params.tokenUsage : null;
     if (!tokenUsage) return;
-    const total = isRecord(tokenUsage.total) ? tokenUsage.total : null;
-    if (!total) return;
-    const totalTokens = typeof total.totalTokens === 'number' ? total.totalTokens : null;
+    // Current-window usage lives in `last`; fall back to nothing (skip the
+    // write) rather than reintroducing the cumulative-`total` 100%-peg bug.
+    const last = isRecord(tokenUsage.last) ? tokenUsage.last : null;
+    if (!last) return;
+    const totalTokens = typeof last.totalTokens === 'number' ? last.totalTokens : null;
     if (totalTokens === null) return;
 
     const modelContextWindow = typeof tokenUsage.modelContextWindow === 'number'
@@ -884,9 +893,9 @@ export class CodexAppServerPTY {
     const cap = modelContextWindow ?? this._config.codex_context_cap ?? 256000;
     const usedPct = cap > 0 ? Math.min(100, (totalTokens / cap) * 100) : null;
 
-    const inputTokens = typeof total.inputTokens === 'number' ? total.inputTokens : 0;
-    const outputTokens = typeof total.outputTokens === 'number' ? total.outputTokens : 0;
-    const cachedInputTokens = typeof total.cachedInputTokens === 'number' ? total.cachedInputTokens : 0;
+    const inputTokens = typeof last.inputTokens === 'number' ? last.inputTokens : 0;
+    const outputTokens = typeof last.outputTokens === 'number' ? last.outputTokens : 0;
+    const cachedInputTokens = typeof last.cachedInputTokens === 'number' ? last.cachedInputTokens : 0;
 
     const payload = JSON.stringify({
       used_percentage: usedPct,

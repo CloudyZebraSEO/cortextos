@@ -675,6 +675,10 @@ describe('AgentManager Telegram poller watchdog', () => {
       authFailed: false,
       wasStale: false,
       authAlerted: false,
+      // A genuinely stale (dead-transport) poller has exited poll-stuck.
+      // The safety-gate requires this in addition to a frozen clock so a
+      // 409-conflict-frozen clock alone can't trigger a fleet self-restart.
+      sawPollStuck: true,
       ...overrides,
     };
   }
@@ -726,6 +730,27 @@ describe('AgentManager Telegram poller watchdog', () => {
       process: runningProcess(),
       checker: {},
       pollerLiveness: staleLiveness({ lastApiOkAt: now - 10_000 }),
+    });
+
+    (am as any).checkTelegramPollerLiveness(now);
+    await flushWatchdogExit();
+
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it('SAFETY-GATE: does NOT self-restart on a frozen clock without a poll-stuck signal (409-conflict storm)', async () => {
+    // A 409-conflict storm freezes lastApiOkAt but never sets sawPollStuck.
+    // This must NOT trigger a fleet self-restart (a self-conflict can no
+    // longer nuke the fleet) — even with two such pollers past quorum.
+    (am as any).agents.set('alice', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness({ sawPollStuck: false }),
+    });
+    (am as any).agents.set('bob', {
+      process: runningProcess(),
+      checker: {},
+      pollerLiveness: staleLiveness({ sawPollStuck: false }),
     });
 
     (am as any).checkTelegramPollerLiveness(now);

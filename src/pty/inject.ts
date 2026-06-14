@@ -69,15 +69,27 @@ export function injectMessage(
   // For very large messages, chunk the write to avoid overwhelming the PTY buffer
   const MAX_CHUNK = 4096;
 
-  if (content.length <= MAX_CHUNK) {
-    write(PASTE_START + content + PASTE_END);
-  } else {
-    // Chunked write for large messages
-    write(PASTE_START);
-    for (let i = 0; i < content.length; i += MAX_CHUNK) {
-      write(content.slice(i, i + MAX_CHUNK));
+  // Wrap the bracketed-paste burst in the same try/catch discipline as the
+  // deferred Enter below: a large chunked inject can still be writing when the
+  // PTY is torn down (hard-restart / daemon recycle), and an uncaught throw
+  // here used to ride the inject-vs-teardown race. With AgentPTY.write() now
+  // no-op'ing under its `killing` guard this is belt-and-suspenders, but it
+  // also covers callers whose write closure throws on a null handle.
+  try {
+    if (content.length <= MAX_CHUNK) {
+      write(PASTE_START + content + PASTE_END);
+    } else {
+      // Chunked write for large messages
+      write(PASTE_START);
+      for (let i = 0; i < content.length; i += MAX_CHUNK) {
+        write(content.slice(i, i + MAX_CHUNK));
+      }
+      write(PASTE_END);
     }
-    write(PASTE_END);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[inject] paste write failed (pty likely torn down): ${msg}`);
+    return;
   }
 
   // Send CRLF after a short delay to submit the pasted content.

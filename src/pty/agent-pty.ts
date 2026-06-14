@@ -40,6 +40,15 @@ export class AgentPTY {
   private config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  /**
+   * Set true the instant kill() begins tearing down the PTY, so any in-flight
+   * write (e.g. a chunked inject burst still running during the enterDelay
+   * window) becomes a no-op instead of writing into a half-killed ConPTY.
+   * That inject-vs-teardown race was a compounding trigger of the native
+   * 0xC0000409 stack-buffer-overrun crashes (native-crash-0xC0000409-rootcause.md).
+   * Reset to false on each fresh spawn().
+   */
+  private killing = false;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -157,6 +166,7 @@ export class AgentPTY {
     });
 
     this._alive = true;
+    this.killing = false;
 
     // Set up output capture
     this.pty.onData((data: string) => {
@@ -288,8 +298,12 @@ export class AgentPTY {
    * Write data to the PTY.
    */
   write(data: string): void {
-    if (!this.pty) {
-      throw new Error('PTY not spawned');
+    // Write-guard (native-crash-0xC0000409-rootcause.md): once kill() has begun,
+    // or the PTY is gone, drop the write instead of throwing into a tearing-down
+    // ConPTY. Silently no-op so an inject burst that overlaps a teardown cannot
+    // crash the child or propagate an uncaught throw up the inject path.
+    if (this.killing || !this.pty) {
+      return;
     }
     this.pty.write(data);
   }
@@ -298,6 +312,8 @@ export class AgentPTY {
    * Kill the PTY process.
    */
   kill(): void {
+    // Set the guard BEFORE pty.kill() so any concurrent write() no-ops.
+    this.killing = true;
     const pty = this.pty;
     if (pty) {
       this._alive = false;

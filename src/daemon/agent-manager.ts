@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
 import { join, relative } from 'path';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramCallbackQuery, TelegramMessage, TelegramMessageReaction } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
@@ -35,6 +35,14 @@ interface PollerLiveness {
   authFailed: boolean;
   wasStale: boolean;
   authAlerted: boolean;
+  /**
+   * Set when the poll loop last exited with 'poll-stuck' (genuine sustained
+   * transport failure), cleared on the next successful getUpdates. The fleet
+   * self-restart safety-gate requires this in addition to a frozen
+   * lastApiOkAt — so a 409 Conflict storm (which freezes the clock WITHOUT
+   * a poll-stuck signal) can never nuke the whole fleet. poller-stale-rootcause.md.
+   */
+  sawPollStuck: boolean;
 }
 
 interface ManagedAgentEntry {
@@ -93,8 +101,34 @@ export class AgentManager {
     if (this.telegramWatchdogTimer) return;
     this.telegramWatchdogTimer = setInterval(() => {
       this.checkTelegramPollerLiveness();
+      this.logRssSample();
     }, WATCHDOG_INTERVAL_MS);
     this.telegramWatchdogTimer.unref?.();
+  }
+
+  /**
+   * Append a daemon RSS sample to state/daemon-rss.jsonl every watchdog tick
+   * (~60s). Lets us measure the memory-growth trend post-poller-dedup and
+   * judge whether the deeper heap root-cause work (#3) is still needed before
+   * the PM2 max_memory_restart recycle (1500M) fires and force-kills every
+   * PTY in the same second (native-crash-0xC0000409-rootcause.md cascade).
+   */
+  private logRssSample(): void {
+    try {
+      const mem = process.memoryUsage();
+      const sample = {
+        ts: Date.now(),
+        rss: mem.rss,
+        heapUsed: mem.heapUsed,
+        heapTotal: mem.heapTotal,
+        external: mem.external,
+        agents: this.agents.size,
+        workers: this.workers.size,
+      };
+      appendFileSync(join(this.ctxRoot, 'state', 'daemon-rss.jsonl'), JSON.stringify(sample) + '\n');
+    } catch {
+      // Best-effort instrumentation; never let it disrupt the watchdog.
+    }
   }
 
   private selfRestartStatePath(): string {
@@ -122,6 +156,7 @@ export class AgentManager {
       authFailed: false,
       wasStale: false,
       authAlerted: false,
+      sawPollStuck: false,
     };
   }
 
@@ -134,6 +169,8 @@ export class AgentManager {
     liveness.lastApiOkAt = Date.now();
     liveness.authFailed = false;
     liveness.wasStale = false;
+    // A successful getUpdates clears any prior sustained-transport-failure flag.
+    liveness.sawPollStuck = false;
     if (wasStale) {
       const msg = `${name}: ${kind} Telegram poller recovered after stale API window.`;
       log(msg);
@@ -185,8 +222,14 @@ export class AgentManager {
       for (const [kind, liveness] of pollers) {
         if (!liveness || liveness.authFailed) continue;
         totalActiveTelegramPollers += 1;
-        const stale = this.isPollerStale(liveness, now);
-        liveness.wasStale = liveness.wasStale || stale;
+        const frozen = this.isPollerStale(liveness, now);
+        liveness.wasStale = liveness.wasStale || frozen;
+        // SAFETY-GATE: only a frozen clock that is ALSO backed by a genuine
+        // sustained-transport failure (poll-stuck) counts toward the fleet
+        // self-restart quorum. A 409 Conflict storm freezes lastApiOkAt
+        // without ever setting sawPollStuck, so a self-conflict can no longer
+        // nuke the fleet (poller-stale-rootcause.md, safety-gate).
+        const stale = frozen && liveness.sawPollStuck;
         if (stale) {
           staleCount += 1;
           staleAgents.push(`${name}:${kind}`);
@@ -839,6 +882,13 @@ export class AgentManager {
             continue;
           }
 
+          // Record a genuine sustained-transport failure so the fleet
+          // self-restart safety-gate can distinguish it from a conflict-frozen
+          // clock. Any non-poll-stuck exit (e.g. conflict-self-die) clears it.
+          if (entry?.pollerLiveness) {
+            entry.pollerLiveness.sawPollStuck = reason === 'poll-stuck';
+          }
+
           log(`Telegram poller for ${name} exited (${reason}). Sleeping ${SUPERVISOR_RESTART_BACKOFF_MS / 1000}s then restarting.`);
           await new Promise(r => setTimeout(r, SUPERVISOR_RESTART_BACKOFF_MS));
         }
@@ -992,6 +1042,10 @@ export class AgentManager {
           continue;
         }
 
+        if (entry?.activityPollerLiveness) {
+          entry.activityPollerLiveness.sawPollStuck = reason === 'poll-stuck';
+        }
+
         log(`Activity-channel poller for ${name} exited (${reason}). Sleeping ${SUPERVISOR_RESTART_BACKOFF_MS / 1000}s then restarting.`);
         await new Promise(r => setTimeout(r, SUPERVISOR_RESTART_BACKOFF_MS));
       }
@@ -1013,8 +1067,16 @@ export class AgentManager {
       return;
     }
 
-    if (entry.poller) entry.poller.stop();
-    if (entry.activityPoller) entry.activityPoller.stop();
+    // Await the poller teardown (abort in-flight getUpdates + loop exit) BEFORE
+    // returning, so a follow-on startAgent never builds a second poller while
+    // the old one still holds a live getUpdates connection on the same bot
+    // token (the 409-conflict storm root cause — poller-stale-rootcause.md).
+    const pollerStops: Promise<void>[] = [];
+    if (entry.poller) pollerStops.push(entry.poller.stopAndWait());
+    if (entry.activityPoller) pollerStops.push(entry.activityPoller.stopAndWait());
+    if (pollerStops.length) {
+      await Promise.all(pollerStops.map((p) => p.catch(() => {})));
+    }
     entry.checker.stop();
     await entry.process.stop();
     this.agents.delete(name);

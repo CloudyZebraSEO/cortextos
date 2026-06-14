@@ -53,6 +53,21 @@ export class TelegramPoller {
   onApiSuccess?: () => void;
 
   /**
+   * Aborts the in-flight getUpdates fetch when stopAndWait() is called, so a
+   * stop does not block on the up-to-30s long-poll before the loop notices
+   * `running === false`. Without this, stopAgent → startAgent kept the old
+   * getUpdates connection alive into the new poller's lifetime → 409 Conflict
+   * storm (poller-stale-rootcause.md).
+   */
+  private inFlightController?: AbortController;
+  /**
+   * Resolves when the start() loop has fully exited. Lets stopAndWait() await
+   * a clean teardown so callers can guarantee no live getUpdates remains.
+   */
+  private loopDonePromise?: Promise<void>;
+  private loopDoneResolve?: () => void;
+
+  /**
    * @param api Telegram API client scoped to a single bot token.
    * @param stateDir Directory for persisted poller state (offset, dedup).
    * @param pollInterval Milliseconds between getUpdates calls.
@@ -111,10 +126,12 @@ export class TelegramPoller {
   async start(): Promise<void> {
     this.running = true;
     this.lastExitReason = '';
+    this.loopDonePromise = new Promise<void>((resolve) => { this.loopDoneResolve = resolve; });
     let consecutiveFailures = 0;
     let firstFailureAt = 0;
     let lastSummaryLogAt = 0;
 
+    try {
     while (this.running) {
       let backoffMs = 0;
       try {
@@ -128,6 +145,11 @@ export class TelegramPoller {
         }
         if (!hadUpdate) backoffMs = 100;
       } catch (err) {
+        // An intentional stop() aborts the in-flight getUpdates, surfacing as
+        // an abort/timeout here. running is already false and lastExitReason
+        // is 'stopped-externally' — exit immediately without backoff so
+        // stopAndWait() resolves promptly.
+        if (!this.running) return;
         const msg = err instanceof Error ? err.message : String(err);
         // A 409 Conflict means another getUpdates connection holds the lock
         // (e.g. a not-yet-released connection lingering ~60s after a daemon
@@ -167,15 +189,38 @@ export class TelegramPoller {
       }
       if (backoffMs > 0) await sleep(backoffMs);
     }
+    } finally {
+      this.loopDoneResolve?.();
+      this.loopDoneResolve = undefined;
+    }
   }
 
   /**
    * Stop the polling loop. Marks the exit as intentional so the supervisor
-   * does not restart it.
+   * does not restart it. Aborts any in-flight getUpdates so the loop exits
+   * without waiting out the long-poll.
    */
   stop(): void {
     this.running = false;
     this.lastExitReason = 'stopped-externally';
+    this.inFlightController?.abort();
+  }
+
+  /**
+   * Stop the loop AND await its full exit. Use this on restart paths
+   * (stopAgent) so the old poller's getUpdates connection is gone before a
+   * new poller is constructed for the same bot token — prevents the 409
+   * Conflict storm that froze pollers and drove fleet self-restarts.
+   */
+  async stopAndWait(): Promise<void> {
+    this.stop();
+    if (this.loopDonePromise) {
+      try {
+        await this.loopDonePromise;
+      } catch {
+        // start() never rejects on a clean stop; ignore defensively.
+      }
+    }
   }
 
   /**
@@ -189,7 +234,18 @@ export class TelegramPoller {
    * update so a crash mid-batch does not drop confirmed state.
    */
   async pollOnce(): Promise<boolean> {
-    const result = await this.api.getUpdates(this.offset, BATCH_LIMIT, LONG_POLL_TIMEOUT_SECONDS);
+    this.inFlightController = new AbortController();
+    let result;
+    try {
+      result = await this.api.getUpdates(
+        this.offset,
+        BATCH_LIMIT,
+        LONG_POLL_TIMEOUT_SECONDS,
+        this.inFlightController.signal,
+      );
+    } finally {
+      this.inFlightController = undefined;
+    }
     this.onApiSuccess?.();
     if (!result?.result?.length) return false;
 

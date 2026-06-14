@@ -326,3 +326,50 @@ describe('TelegramPoller — self-healing loop', () => {
     expect(existsSync(offsetFile)).toBe(false);
   });
 });
+
+describe('TelegramPoller — stopAndWait (poller-dedup teardown)', () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'cortextos-poller-stop-'));
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it('aborts an in-flight getUpdates and resolves with stopped-externally', async () => {
+    let abortReceived = false;
+    const api = {
+      // Long-poll that never resolves on its own — only an abort ends it.
+      getUpdates: vi.fn((_offset: number, _limit: number, _timeout: number, signal?: AbortSignal) => {
+        return new Promise((_resolve, reject) => {
+          if (signal) {
+            signal.addEventListener('abort', () => {
+              abortReceived = true;
+              reject(new Error('Telegram API request timed out after 30000ms: getUpdates'));
+            });
+          }
+        });
+      }),
+    } as unknown as TelegramAPI;
+
+    const poller = new TelegramPoller(api, stateDir);
+    const startP = poller.start();
+    // Let the loop enter the in-flight getUpdates before stopping.
+    await new Promise((r) => setTimeout(r, 20));
+
+    await poller.stopAndWait();
+    await startP; // start() must have fully exited
+
+    expect(abortReceived).toBe(true);
+    expect(poller.lastExitReason).toBe('stopped-externally');
+  });
+
+  it('resolves cleanly when the poller was never started', async () => {
+    const { api } = makeStubApi([]);
+    const poller = new TelegramPoller(api, stateDir);
+    await expect(poller.stopAndWait()).resolves.toBeUndefined();
+    expect(poller.lastExitReason).toBe('stopped-externally');
+  });
+});

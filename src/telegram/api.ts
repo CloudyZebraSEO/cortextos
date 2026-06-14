@@ -371,14 +371,14 @@ export class TelegramAPI {
    *                 or `timeout` seconds elapse. We override the client-side abort
    *                 to `(timeout * 1000) + 5000` so we never abort before Telegram does.
    */
-  async getUpdates(offset: number, limit: number = 1, timeout: number = 0): Promise<any> {
+  async getUpdates(offset: number, limit: number = 1, timeout: number = 0, signal?: AbortSignal): Promise<any> {
     const clientTimeoutMs = timeout > 0 ? (timeout * 1000) + 5000 : 15000;
     return this.post('getUpdates', {
       offset,
       limit,
       timeout,
       allowed_updates: ['message', 'callback_query', 'message_reaction'],
-    }, clientTimeoutMs);
+    }, clientTimeoutMs, signal);
   }
 
   /**
@@ -625,13 +625,22 @@ export class TelegramAPI {
    *   (getUpdates with timeout > 0) MUST raise this above the server-side
    *   long-poll timeout, or the local abort fires before Telegram returns.
    */
-  private async post(method: string, data: object, timeoutMs: number = 15000): Promise<any> {
+  private async post(method: string, data: object, timeoutMs: number = 15000, externalSignal?: AbortSignal): Promise<any> {
+    // Combine the per-request timeout with an optional caller-supplied abort
+    // signal (used by TelegramPoller.stopAndWait to cancel an in-flight
+    // getUpdates long-poll immediately on stop, instead of waiting up to
+    // ~30s for the long-poll to return — which is what let a torn-down
+    // poller keep a getUpdates connection alive and 409-conflict with the
+    // freshly-started one across a stop/start restart).
+    const signal = externalSignal
+      ? AbortSignal.any([AbortSignal.timeout(timeoutMs), externalSignal])
+      : AbortSignal.timeout(timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal,
       });
       const result = await response.json() as any;
       if (!result.ok) {

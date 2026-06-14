@@ -77,6 +77,22 @@ describe('injectMessage - deferred submit safety', () => {
     expect(warnSpy.mock.calls[0][0]).toMatch(/deferred Enter failed/);
   });
 
+  it('swallows a throw from the synchronous paste burst (PTY torn down mid-inject)', () => {
+    // The bracketed-paste burst itself can race a teardown when a large chunked
+    // inject is still writing as the PTY dies. The throw must be swallowed, not
+    // propagated, and the deferred Enter must not fire afterwards.
+    const write = () => { throw new TypeError("Cannot read properties of null (reading 'write')"); };
+
+    expect(() => injectMessage(write, 'x'.repeat(10000), 300)).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/paste write failed/);
+
+    // Because the paste burst aborted early, the deferred Enter is never scheduled.
+    warnSpy.mockClear();
+    expect(() => vi.advanceTimersByTime(300)).not.toThrow();
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
   it('sends CRLF submit normally when the PTY stays alive', () => {
     const writes: string[] = [];
     const write = (data: string) => { writes.push(data); };
