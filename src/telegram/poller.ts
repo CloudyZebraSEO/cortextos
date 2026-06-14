@@ -17,6 +17,10 @@ const LONG_POLL_TIMEOUT_SECONDS = 25;
 export const BACKOFF_CAP_MS = 30_000;
 export const LOG_SUMMARY_MS = 120_000;
 export const ESCALATE_AFTER_MS = 120_000;
+// Upper bound on how long stopAndWait() blocks for the loop to exit. Generous
+// enough for a normal handler/backoff to finish, bounded so a slow/stuck
+// handler cannot wedge the stop/restart lifecycle (codex review, MEDIUM).
+export const STOP_WAIT_TIMEOUT_MS = 10_000;
 
 export type TelegramPollerExitReason =
   | ''
@@ -207,19 +211,33 @@ export class TelegramPoller {
   }
 
   /**
-   * Stop the loop AND await its full exit. Use this on restart paths
+   * Stop the loop AND await its full exit (bounded). Use this on restart paths
    * (stopAgent) so the old poller's getUpdates connection is gone before a
    * new poller is constructed for the same bot token — prevents the 409
    * Conflict storm that froze pollers and drove fleet self-restarts.
+   *
+   * BOUNDED wait (codex review, MEDIUM): stop() aborts an in-flight getUpdates
+   * immediately, but if the loop is instead inside a slow update handler (e.g.
+   * media download) or a backoff sleep, loopDonePromise resolves only when that
+   * completes. Racing it against a timeout keeps stopAgent/restart responsive.
+   * Returning early is SAFE: stop() already set running=false, so the loop will
+   * NOT issue another getUpdates — no second connection can race the new poller
+   * even if a handler is still finishing.
    */
-  async stopAndWait(): Promise<void> {
+  async stopAndWait(timeoutMs: number = STOP_WAIT_TIMEOUT_MS): Promise<void> {
     this.stop();
-    if (this.loopDonePromise) {
-      try {
-        await this.loopDonePromise;
-      } catch {
-        // start() never rejects on a clean stop; ignore defensively.
-      }
+    if (!this.loopDonePromise) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bounded = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([this.loopDonePromise, bounded]);
+    } catch {
+      // start() never rejects on a clean stop; ignore defensively.
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

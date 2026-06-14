@@ -372,4 +372,31 @@ describe('TelegramPoller — stopAndWait (poller-dedup teardown)', () => {
     await expect(poller.stopAndWait()).resolves.toBeUndefined();
     expect(poller.lastExitReason).toBe('stopped-externally');
   });
+
+  it('returns within the bound even when the loop is wedged in a slow handler (codex MEDIUM)', async () => {
+    // getUpdates returns instantly with an update; the handler then hangs.
+    // stop() aborts the (already-returned) fetch but the loop is stuck awaiting
+    // the handler — stopAndWait must still resolve via its bounded timeout.
+    let releaseHandler: (() => void) | null = null;
+    const api = {
+      getUpdates: vi.fn(async () => ({ result: [makeMessageUpdate(900, 'hang')] })),
+    } as unknown as TelegramAPI;
+    const poller = new TelegramPoller(api, stateDir);
+    poller.onMessage(() => new Promise<void>((resolve) => { releaseHandler = resolve; }));
+
+    const startP = poller.start();
+    // Let the loop enter the hanging handler.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Bound at 50ms — must resolve well before the hung handler would.
+    const t0 = Date.now();
+    await poller.stopAndWait(50);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(2000);
+    expect(poller.lastExitReason).toBe('stopped-externally');
+
+    // Cleanup: release the handler so start() can unwind, then await it.
+    releaseHandler?.();
+    await startP;
+  });
 });
