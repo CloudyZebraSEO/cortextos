@@ -246,6 +246,13 @@ describe('detectClaudeApiTransientInLog', () => {
     expect(reason).toBeNull();
   });
 
+  it('ignores stale transient errors outside the final exit window', () => {
+    const stale = 'API Error: 502 Bad Gateway\n';
+    const recoveredWork = 'normal work continued after recovery\n'.repeat(400);
+    const reason = detectClaudeApiTransientInLog(writeLog(stale + recoveredWork + 'native process exited unexpectedly\n'));
+    expect(reason).toBeNull();
+  });
+
   it('returns null for a missing log', () => {
     expect(detectClaudeApiTransientInLog(join(tmp, 'missing.log'))).toBeNull();
   });

@@ -149,16 +149,20 @@ export function notifyAgents(opts: {
 }
 
 /**
- * Scan stdout.log for transient Claude API/backend failures that can make the
- * Claude Code session exit even though the cortextOS agent process is healthy
- * and will immediately resume. Deliberately does NOT match plain
- * "401 Invalid authentication credentials" because an expired OAuth token is a
- * real operator-actionable fault and should still alert as a crash/auth issue.
+ * Scan the final stdout.log fragment for transient Claude API/backend failures
+ * that can make the Claude Code session exit even though the cortextOS agent
+ * process is healthy and will immediately resume. This intentionally reads a
+ * much tighter window than rate-limit detection: transient 5xx/socket errors
+ * can occur and recover mid-session, so a stale match from earlier in the log
+ * must not suppress a later unrelated real crash. Deliberately does NOT match
+ * plain "401 Invalid authentication credentials" because an expired OAuth token
+ * is a real operator-actionable fault and should still alert as a crash/auth
+ * issue.
  */
 export function detectClaudeApiTransientInLog(logPath: string): string | null {
   try {
     const size = statSync(logPath).size;
-    const readBytes = Math.min(size, 200 * 1024);
+    const readBytes = Math.min(size, 8 * 1024);
     const fd = readFileSync(logPath);
     const slice = fd.slice(Math.max(0, fd.length - readBytes)).toString('utf-8');
     const text = slice.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').toLowerCase();
