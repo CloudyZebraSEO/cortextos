@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
 import { join, relative } from 'path';
+import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramCallbackQuery, TelegramMessage, TelegramMessageReaction } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
@@ -26,6 +27,12 @@ const ESCALATE_AFTER_MS = 120_000;
 const DAEMON_SELF_RESTART_MS = 600_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
 const SELF_RESTART_MIN_INTERVAL_MS = 1_800_000;
+// FIX 3 restart-storm detector (Signals 1+2). Oscillation resets PM2's
+// consecutive-restart counter so it never goes errored — so we detect a storm
+// by TOTAL daemon births in a rolling window, independent of PM2.
+const RESTART_STORM_WINDOW_MS = 600_000; // 10 min
+const RESTART_STORM_THRESHOLD = 3; // > this many daemon births in the window = storm
+const RESTART_STORM_ALERT_COOLDOWN_MS = 600_000; // at most one CRITICAL alert per 10 min
 
 type PollerKind = 'primary' | 'activity';
 
@@ -104,6 +111,12 @@ export class AgentManager {
       console.log('[agent-manager] Detected .daemon-crashed marker(s) — previous daemon exited abnormally. Will quiet BUG-011 alarm for this startup cycle.');
     }
     this.startTelegramPollerWatchdog();
+    // FIX 3 (restart-storm detector): runs on EVERY daemon birth, because in a
+    // tight crash-loop the daemon never lives long enough for an interval-based
+    // check to fire. Records this start + alerts CRITICAL if the daemon is
+    // restarting abnormally fast — so a pipe-deadlock loop can never silent-loop
+    // for hours again (the 6/2 + 6/16 failure). Best-effort, never throws.
+    this.recordAndCheckRestartStorm().catch(() => {});
   }
 
   private startTelegramPollerWatchdog(): void {
@@ -268,6 +281,107 @@ export class AgentManager {
     this.alertSelfRestart(
       `🚨 WATCHDOG: Telegram pollers stale (${staleAgents.join(', ')}). Restarting daemon to clear poisoned Telegram transport state.`,
     ).finally(() => this.exitProcess(1));
+  }
+
+  /**
+   * FIX 3 restart-storm detector (Signals 1+2). Runs on EVERY daemon birth, so
+   * it fires even in a tight crash-loop where the daemon never lives long enough
+   * for an interval check. Records this start; if the daemon has been (re)born
+   * more than RESTART_STORM_THRESHOLD times within RESTART_STORM_WINDOW_MS,
+   * raises a CRITICAL operator alert (rate-limited) so an IPC-pipe-deadlock loop
+   * can never silent-loop for hours again (the 6/2 + 6/16 failure). Also reports
+   * Signal 2 (pipe-not-released) when the daemon error log shows the deadlock
+   * fatal. Best-effort — never throws.
+   */
+  private async recordAndCheckRestartStorm(): Promise<void> {
+    try {
+      const stateDir = join(this.ctxRoot, 'state');
+      try { mkdirSync(stateDir, { recursive: true }); } catch { /* ignore */ }
+      const histPath = join(stateDir, 'daemon-restart-history.jsonl');
+      const now = Date.now();
+      try { appendFileSync(histPath, JSON.stringify({ ts: now }) + '\n'); } catch { /* ignore */ }
+
+      // Collect births within the rolling window.
+      const births: number[] = [];
+      try {
+        for (const line of readFileSync(histPath, 'utf-8').trim().split('\n')) {
+          try {
+            const t = (JSON.parse(line) as { ts?: number }).ts;
+            if (typeof t === 'number' && now - t <= RESTART_STORM_WINDOW_MS) births.push(t);
+          } catch { /* skip malformed line */ }
+        }
+      } catch { /* ignore */ }
+      // Prune the history file to just the window so it can't grow unbounded.
+      try { writeFileSync(histPath, births.map((t) => JSON.stringify({ ts: t })).join('\n') + '\n'); } catch { /* ignore */ }
+
+      if (births.length <= RESTART_STORM_THRESHOLD) return; // Signal 1 not tripped
+
+      // Signal 2: pipe-not-released fatal in the daemon error log.
+      let pipeDeadlock = false;
+      try {
+        const elog = join(homedir(), '.pm2', 'logs', 'cortextos-daemon-error.log');
+        if (existsSync(elog)) {
+          const buf = readFileSync(elog);
+          const tail = buf.slice(Math.max(0, buf.length - 16 * 1024)).toString('utf-8');
+          pipeDeadlock = /in use by a live process|IPC path .*is in use/i.test(tail);
+        }
+      } catch { /* ignore */ }
+
+      // Rate-limit the CRITICAL alert — a tight loop births many times.
+      const flagPath = join(stateDir, '.restart-storm-alerted');
+      try {
+        if (existsSync(flagPath)) {
+          const last = parseInt(readFileSync(flagPath, 'utf-8').trim(), 10);
+          if (!isNaN(last) && now - last < RESTART_STORM_ALERT_COOLDOWN_MS) return;
+        }
+      } catch { /* ignore */ }
+      try { writeFileSync(flagPath, String(now)); } catch { /* ignore */ }
+
+      const msg =
+        `🚨 CRITICAL: cortextos daemon RESTART STORM — ${births.length} restarts in ` +
+        `${Math.round(RESTART_STORM_WINDOW_MS / 60000)}min` +
+        (pipeDeadlock
+          ? ' + IPC pipe-deadlock detected ("in use by a live process") — daemon cannot bind its pipe.'
+          : '.') +
+        ' Daemon is crash-looping. Check: pm2 describe cortextos-daemon + ~/.pm2/logs/cortextos-daemon-error.log.';
+      console.error(`[agent-manager] ${msg}`);
+      await this.sendStartupOperatorAlert(msg);
+    } catch { /* detector must never throw */ }
+  }
+
+  /**
+   * Send a one-off operator alert at daemon-startup time, before per-agent
+   * Telegram handles exist. Reads the org orchestrator's bot credentials from
+   * its .env (falling back to any agent with a usable token) and sends directly.
+   * Best-effort.
+   */
+  private async sendStartupOperatorAlert(message: string): Promise<void> {
+    try {
+      const orgDir = join(this.frameworkRoot, 'orgs', this.org);
+      const candidates: string[] = [];
+      try {
+        const orch = JSON.parse(stripBom(readFileSync(join(orgDir, 'context.json'), 'utf-8'))).orchestrator;
+        if (typeof orch === 'string' && orch) candidates.push(orch);
+      } catch { /* ignore */ }
+      try {
+        for (const d of readdirSync(join(orgDir, 'agents'), { withFileTypes: true })) {
+          if (d.isDirectory() && !candidates.includes(d.name)) candidates.push(d.name);
+        }
+      } catch { /* ignore */ }
+      for (const name of candidates) {
+        try {
+          const envFile = join(orgDir, 'agents', name, '.env');
+          if (!existsSync(envFile)) continue;
+          const env = stripBom(readFileSync(envFile, 'utf-8'));
+          const token = env.match(/^BOT_TOKEN=(.+)$/m)?.[1]?.trim();
+          const chatId = env.match(/^CHAT_ID=(.+)$/m)?.[1]?.trim();
+          if (token && chatId && /^\d+:[A-Za-z0-9_-]+$/.test(token)) {
+            await new TelegramAPI(token).sendMessage(chatId, message);
+            return;
+          }
+        } catch { /* try next candidate */ }
+      }
+    } catch { /* ignore */ }
   }
 
   /**

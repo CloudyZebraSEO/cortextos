@@ -528,9 +528,24 @@ export class IPCServer {
    */
   private opChain: Promise<unknown> = Promise.resolve();
 
-  constructor(agentManager: AgentManager, instanceId: string = 'default') {
+  /**
+   * EADDRINUSE probe-retry config (FIX 1 probe-retry-on-true). Configurable so
+   * tests can inject fast/single-attempt values; prod defaults ride out a
+   * cleanly-exiting predecessor's pipe-release lag without being so long that a
+   * genuine live-incumbent conflict takes ages to surface.
+   */
+  private probeRetryAttempts: number;
+  private probeRetryDelayMs: number;
+
+  constructor(
+    agentManager: AgentManager,
+    instanceId: string = 'default',
+    opts?: { probeRetryAttempts?: number; probeRetryDelayMs?: number },
+  ) {
     this.agentManager = agentManager;
     this.socketPath = getIpcPath(instanceId);
+    this.probeRetryAttempts = opts?.probeRetryAttempts ?? 6;
+    this.probeRetryDelayMs = opts?.probeRetryDelayMs ?? 2000;
   }
 
   /**
@@ -725,11 +740,12 @@ export class IPCServer {
    * persistently-live incumbent. A probe that REJECTS (inconclusive — EACCES
    * etc.) propagates so the caller refuses to unlink, exactly as before.
    */
-  private async probeSocketLiveWithRetry(attempts = 8, delayMs = 2000): Promise<boolean> {
+  private async probeSocketLiveWithRetry(): Promise<boolean> {
+    const attempts = Math.max(1, this.probeRetryAttempts);
     for (let i = 0; i < attempts; i++) {
       const live = await this.probeSocketLive();
       if (!live) return false;
-      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, this.probeRetryDelayMs));
     }
     return true;
   }

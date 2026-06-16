@@ -45,7 +45,11 @@ afterEach(async () => {
 });
 
 function makeServer(instanceId: string): IPCServer {
-  const srv = new IPCServer(stubAgentManager, instanceId);
+  // probeRetryAttempts: 1 = the original single-probe behavior. These tests use
+  // a REAL live first server, so the contender's probe sees a genuinely-live
+  // owner and must reject immediately (the multi-attempt retry only matters for
+  // a DYING predecessor whose pipe is about to free — covered by its own test).
+  const srv = new IPCServer(stubAgentManager, instanceId, { probeRetryAttempts: 1, probeRetryDelayMs: 0 });
   servers.push(srv);
   return srv;
 }
@@ -136,6 +140,43 @@ describe('IPCServer lifecycle (OOM-cascade leak fixes)', () => {
         client.once('connect', () => resolve());
         client.once('error', reject);
         setTimeout(() => reject(new Error('live server unreachable — path was stolen')), 2000);
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('FORCE-REPRO: a successor RECLAIMS a dying predecessor\'s pipe via probe-retry (no fatal loop)', async () => {
+    // This is the IPC-pipe-deadlock fix in miniature: a predecessor holds the
+    // pipe and is still answering IPC pings (looks "live"), then exits during
+    // the successor's start. The probe-retry-on-true path must ride out the
+    // brief overlap and BIND, instead of fataling ("in use by a live process")
+    // and crash-looping. Fast retry params keep the test quick.
+    const instanceId = uniqueInstanceId();
+    const predecessor = makeServer(instanceId);
+    await predecessor.start();
+
+    // Successor with a multi-attempt retry (the dying-predecessor case).
+    const successor = new IPCServer(stubAgentManager, instanceId, { probeRetryAttempts: 6, probeRetryDelayMs: 250 });
+    servers.push(successor);
+
+    // The predecessor exits shortly after the successor begins probing — so the
+    // first probe sees it live, a later retry sees it gone, and the successor binds.
+    setTimeout(() => { predecessor.stop().catch(() => {}); }, 120);
+
+    await expect(
+      Promise.race([
+        successor.start(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('successor.start() never resolved — reclaim failed')), 5000)),
+      ]),
+    ).resolves.toBeUndefined();
+
+    // Successor now owns the pipe: a fresh client connects to IT.
+    const client = createConnection(getIpcPath(instanceId));
+    sockets.push(client);
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        client.once('connect', () => resolve());
+        client.once('error', reject);
+        setTimeout(() => reject(new Error('successor unreachable after reclaim')), 2000);
       }),
     ).resolves.toBeUndefined();
   });
