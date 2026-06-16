@@ -33,6 +33,11 @@ const SELF_RESTART_MIN_INTERVAL_MS = 1_800_000;
 const RESTART_STORM_WINDOW_MS = 600_000; // 10 min
 const RESTART_STORM_THRESHOLD = 3; // > this many daemon births in the window = storm
 const RESTART_STORM_ALERT_COOLDOWN_MS = 600_000; // at most one CRITICAL alert per 10 min
+// Cap on how long the watchdog waits for its best-effort Telegram alert to send
+// before calling exitProcess(1). Bounds the dying daemon's IPC-alive window so a
+// successor's probe-retry (~12s) strictly dominates it — closes the residual
+// loop where the alert's ~15s API timeout delayed exit past the retry window.
+const ALERT_BEFORE_EXIT_MS = 3000;
 
 type PollerKind = 'primary' | 'activity';
 
@@ -278,9 +283,20 @@ export class AgentManager {
 
     this.writeSelfRestartState(reason, staleAgents, now);
     console.error(`[agent-manager] Telegram poller watchdog self-restarting daemon: ${reason}`);
-    this.alertSelfRestart(
-      `🚨 WATCHDOG: Telegram pollers stale (${staleAgents.join(', ')}). Restarting daemon to clear poisoned Telegram transport state.`,
-    ).finally(() => this.exitProcess(1));
+    // BOUND the alert-before-exit (incident-path closure, 2026-06-16): the
+    // Telegram send has a ~15s API timeout, and .finally(exitProcess) delays the
+    // daemon's exit until the send settles — keeping the OLD daemon ALIVE serving
+    // IPC for up to ~15s, which can EXCEED the successor's ~12s probe-retry window
+    // and re-fatal it. Cap the alert so the daemon exits fast; disposeSync
+    // (process.on('exit')) then frees the pipe well inside the successor's retry
+    // window. The alert is best-effort (FIX 3 storm-detector re-alerts on the
+    // successor's birth if delivery was cut short).
+    Promise.race([
+      this.alertSelfRestart(
+        `🚨 WATCHDOG: Telegram pollers stale (${staleAgents.join(', ')}). Restarting daemon to clear poisoned Telegram transport state.`,
+      ),
+      new Promise((resolve) => setTimeout(resolve, ALERT_BEFORE_EXIT_MS)),
+    ]).finally(() => this.exitProcess(1));
   }
 
   /**
