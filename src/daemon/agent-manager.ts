@@ -69,6 +69,15 @@ export class AgentManager {
   // Tracks agents that received a start request while still stopping.
   // stopAgent() honors these after cleanup completes so restart-all is race-free.
   private pendingRestarts: Set<string> = new Set();
+  // FIX 0 (BUG-011 hardening, 2026-06-16): in-flight stopAgent promises keyed by
+  // agent name. startAgent awaits any in-flight stop for the same name before
+  // proceeding, so the incumbent FULLY releases ownership (registry entry,
+  // poller, PTY) before a successor starts — serializing start-vs-stop instead
+  // of relying on the pendingRestarts timing band-aid. Closes the BUG-011
+  // re-leak where a restart-triggered startAgent raced an in-flight teardown
+  // (widened by a50fcf7's stopAndWait-before-delete). Also dedups concurrent
+  // stops of the same agent.
+  private stoppingAgents: Map<string, Promise<void>> = new Map();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -450,6 +459,19 @@ export class AgentManager {
   }
 
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
+    // FIX 0 (BUG-011 hardening): if a stopAgent for this name is still tearing
+    // down, await its FULL completion first so the incumbent has released the
+    // registry entry, poller, and PTY before we start the successor. This is the
+    // clean single-owner handoff — it removes the start-vs-stop race that
+    // re-leaked BUG-011 on 2026-06-16 (startAgent finding the agent still in the
+    // registry mid-teardown). After the await the registry is clean for the
+    // common restart path, so the legacy pendingRestarts guard below now only
+    // catches genuine post-crash discovery overlap.
+    const inFlightStop = this.stoppingAgents.get(name);
+    if (inFlightStop) {
+      await inFlightStop.catch(() => {});
+    }
+
     if (this.agents.has(name)) {
       // BUG-031: this branch was the workaround for the BUG-011 PTY race
       // (restart-all could send stop+start simultaneously, and the new
@@ -1058,9 +1080,23 @@ export class AgentManager {
   }
 
   /**
-   * Stop a specific agent.
+   * Stop a specific agent. Tracks its in-flight promise in stoppingAgents so
+   * startAgent can serialize behind it (FIX 0 clean handoff), and dedups
+   * concurrent stops of the same agent.
    */
   async stopAgent(name: string): Promise<void> {
+    const existing = this.stoppingAgents.get(name);
+    if (existing) return existing;
+    const stopPromise = this._doStopAgent(name);
+    this.stoppingAgents.set(name, stopPromise);
+    try {
+      await stopPromise;
+    } finally {
+      this.stoppingAgents.delete(name);
+    }
+  }
+
+  private async _doStopAgent(name: string): Promise<void> {
     const entry = this.agents.get(name);
     if (!entry) {
       console.log(`[agent-manager] Agent ${name} not found`);
@@ -1164,13 +1200,20 @@ export class AgentManager {
       }
     }
 
-    for (const name of names) {
-      try {
-        await this.stopAgent(name);
-      } catch (err) {
-        console.error(`[agent-manager] Error stopping ${name}:`, err);
-      }
-    }
+    // FIX 2 (fast shutdown): stop agents in PARALLEL, not sequentially. Each
+    // stopAgent can take many seconds (graceful /exit + the node-pty
+    // _getConsoleProcessList 5s timeout on every PTY kill), so a sequential loop
+    // over 6 agents could hold the daemon down — and the IPC pipe — for a minute
+    // or more, which is what let a restarting successor collide on the pipe and
+    // crash-loop. Parallel reduces total shutdown to ~the slowest single agent.
+    // Per-agent errors are isolated so one wedged agent can't block the rest.
+    await Promise.all(
+      names.map((name) =>
+        this.stopAgent(name).catch((err) => {
+          console.error(`[agent-manager] Error stopping ${name}:`, err);
+        }),
+      ),
+    );
   }
 
   /**

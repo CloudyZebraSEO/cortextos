@@ -678,7 +678,13 @@ export class IPCServer {
           // mid-bind). Re-probe before unlinking — blindly removing it could
           // strand a live owner = split-brain. Only unlink + retry listen once
           // when nothing is listening; otherwise reject and surface the truth.
-          this.probeSocketLive().then((live) => {
+          // probe-retry-on-true (FIX 1): a DYING predecessor can keep the pipe
+          // "live" for a brief window (Windows releases the handle at full
+          // process death), which is exactly the restart-race that crash-looped
+          // the daemon. Retrying the probe rides out that release lag and binds,
+          // instead of fataling; a genuinely-live incumbent stays "live" across
+          // the retries and is still correctly refused (split-brain preserved).
+          this.probeSocketLiveWithRetry().then((live) => {
             if (live) {
               failStart(new Error(
                 `IPC path ${this.socketPath} is in use by a live process; refusing to unlink it ` +
@@ -709,6 +715,25 @@ export class IPCServer {
    * detaches the probe's own listeners so a late event can't re-trigger the
    * stale-socket branch after the promise already settled.
    */
+  /**
+   * probeSocketLive with retry-on-true. When a probe reports "live", a dying
+   * predecessor may simply not have released the named pipe yet (Windows frees
+   * the handle only at full process death; server.close() is async). Re-probe
+   * up to `attempts` times with `delayMs` between, concluding a genuine live
+   * owner ONLY if it is still live after all attempts. This auto-heals the
+   * restart-race (bind once the predecessor is gone) without ever clobbering a
+   * persistently-live incumbent. A probe that REJECTS (inconclusive — EACCES
+   * etc.) propagates so the caller refuses to unlink, exactly as before.
+   */
+  private async probeSocketLiveWithRetry(attempts = 8, delayMs = 2000): Promise<boolean> {
+    for (let i = 0; i < attempts; i++) {
+      const live = await this.probeSocketLive();
+      if (!live) return false;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+    }
+    return true;
+  }
+
   private probeSocketLive(): Promise<boolean> {
     return new Promise<boolean>((resolve, reject) => {
       const probe = createConnection(this.socketPath);
