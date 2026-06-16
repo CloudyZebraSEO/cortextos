@@ -38,6 +38,11 @@ const RESTART_STORM_ALERT_COOLDOWN_MS = 600_000; // at most one CRITICAL alert p
 // successor's probe-retry (~12s) strictly dominates it — closes the residual
 // loop where the alert's ~15s API timeout delayed exit past the retry window.
 const ALERT_BEFORE_EXIT_MS = 3000;
+// Cap on total stopAll() duration during shutdown. Keeps the pipe-hold window
+// (pipe released after stopAll) strictly below the successor's probe-retry
+// window so a wedged agent stop can't re-fatal the successor. Stragglers are
+// reaped on process exit.
+const STOPALL_CAP_MS = 8000;
 
 type PollerKind = 'primary' | 'activity';
 
@@ -343,7 +348,12 @@ export class AgentManager {
         }
       } catch { /* ignore */ }
 
-      // Rate-limit the CRITICAL alert — a tight loop births many times.
+      // Rate-limit the CRITICAL alert — a tight loop births many times. The
+      // cooldown flag records the last SUCCESSFUL alert, so a failed/aborted
+      // send never suppresses the next attempt (codex HIGH: the daemon exits
+      // fast on the fatal, killing an in-flight send — if we wrote the flag
+      // before the send, the storm alert would self-suppress for 10min = silent
+      // loop again, defeating FIX 3's whole purpose).
       const flagPath = join(stateDir, '.restart-storm-alerted');
       try {
         if (existsSync(flagPath)) {
@@ -351,7 +361,6 @@ export class AgentManager {
           if (!isNaN(last) && now - last < RESTART_STORM_ALERT_COOLDOWN_MS) return;
         }
       } catch { /* ignore */ }
-      try { writeFileSync(flagPath, String(now)); } catch { /* ignore */ }
 
       const msg =
         `🚨 CRITICAL: cortextos daemon RESTART STORM — ${births.length} restarts in ` +
@@ -361,7 +370,12 @@ export class AgentManager {
           : '.') +
         ' Daemon is crash-looping. Check: pm2 describe cortextos-daemon + ~/.pm2/logs/cortextos-daemon-error.log.';
       console.error(`[agent-manager] ${msg}`);
-      await this.sendStartupOperatorAlert(msg);
+      const sent = await this.sendStartupOperatorAlert(msg);
+      // Only start the cooldown once the alert actually went out — otherwise an
+      // aborted send (process exiting) would silently suppress the next birth's alert.
+      if (sent) {
+        try { writeFileSync(flagPath, String(now)); } catch { /* ignore */ }
+      }
     } catch { /* detector must never throw */ }
   }
 
@@ -369,9 +383,10 @@ export class AgentManager {
    * Send a one-off operator alert at daemon-startup time, before per-agent
    * Telegram handles exist. Reads the org orchestrator's bot credentials from
    * its .env (falling back to any agent with a usable token) and sends directly.
-   * Best-effort.
+   * Best-effort. Returns true only if a send actually succeeded (so the caller
+   * starts the alert cooldown only on real delivery).
    */
-  private async sendStartupOperatorAlert(message: string): Promise<void> {
+  private async sendStartupOperatorAlert(message: string): Promise<boolean> {
     try {
       const orgDir = join(this.frameworkRoot, 'orgs', this.org);
       const candidates: string[] = [];
@@ -393,11 +408,12 @@ export class AgentManager {
           const chatId = env.match(/^CHAT_ID=(.+)$/m)?.[1]?.trim();
           if (token && chatId && /^\d+:[A-Za-z0-9_-]+$/.test(token)) {
             await new TelegramAPI(token).sendMessage(chatId, message);
-            return;
+            return true;
           }
         } catch { /* try next candidate */ }
       }
     } catch { /* ignore */ }
+    return false;
   }
 
   /**
@@ -617,18 +633,20 @@ export class AgentManager {
       // this branch is dormant. Once we have weeks of zero-warning
       // production data, we can delete the queue mechanism entirely.
       if (this.daemonJustCrashed) {
-        // Post-crash startup. The previous daemon exited via
-        // uncaughtException without running stopAll(), so the in-memory
-        // registry from the prior process is gone — but the post-crash
-        // discoverAndStart pass can briefly re-enter startAgent for an
-        // agent whose pendingRestarts entry survived. This is benign and
-        // distinct from the BUG-011 in-flight race PR #11 closed. Log at
-        // info level so operators don't think PR #11 has regressed.
+        // Post-crash startup. Keep the legacy pendingRestarts safety net for the
+        // post-crash discovery-overlap case (benign, distinct from BUG-011).
         console.log(`[agent-manager] ${name} already in registry (post-crash discovery overlap, expected). Queueing restart.`);
+        this.pendingRestarts.add(name);
       } else {
-        console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+        // FIX 0 already awaited any in-flight stopAgent above, so reaching here
+        // means a genuine DUPLICATE start of an already-RUNNING agent (e.g. IPC
+        // dispatches start even on a DEDUPED classification). Treat it as a
+        // NO-OP — do NOT queue pendingRestarts, or a later legitimate stopAgent
+        // would honor the stale flag and unexpectedly restart the agent (codex
+        // HIGH #2). With the handoff serialization this is no longer a BUG-011
+        // race, just a redundant start, so no regression warning either.
+        console.log(`[agent-manager] ${name} already running — duplicate start ignored (no-op).`);
       }
-      this.pendingRestarts.add(name);
       return;
     }
 
@@ -1337,13 +1355,26 @@ export class AgentManager {
     // or more, which is what let a restarting successor collide on the pipe and
     // crash-loop. Parallel reduces total shutdown to ~the slowest single agent.
     // Per-agent errors are isolated so one wedged agent can't block the rest.
-    await Promise.all(
+    //
+    // BOUNDED (codex MEDIUM #3): cap the whole stopAll at STOPALL_CAP_MS so the
+    // pipe-hold window (pipe is released by the caller AFTER stopAll) stays
+    // strictly below the successor's probe-retry window — turning the deadlock
+    // fix from bounded-mitigation into elimination WITHOUT early-releasing the
+    // pipe (which would open a cross-process double-agent-management window).
+    // A straggler PTY that exceeds the cap is reaped when the process exits —
+    // acceptable on a restart, and far better than holding the pipe past the
+    // retry window and re-fataling the successor.
+    const stopAllDone = Promise.all(
       names.map((name) =>
         this.stopAgent(name).catch((err) => {
           console.error(`[agent-manager] Error stopping ${name}:`, err);
         }),
       ),
     );
+    await Promise.race([
+      stopAllDone,
+      new Promise<void>((resolve) => setTimeout(resolve, STOPALL_CAP_MS)),
+    ]);
   }
 
   /**
