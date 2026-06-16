@@ -7,6 +7,10 @@
  *     classifies the exit as "rate-limited" so it is suppressed rather than
  *     spamming a 🚨 CRASH alert every 30 minutes while the daemon respawn
  *     loop continues hitting the wall.
+ *   - Detects transient Claude API/backend transport failures in stdout.log and
+ *     classifies the exit as "claude-api-error" instead of a real crash. This
+ *     keeps short provider/socket failures from incrementing crash counts or
+ *     paging as "died unexpectedly" while preserving genuine auth failures.
  *   - Applies quiet hours (22:00-07:00 America/Los_Angeles) for routine end
  *     types (planned-restart, session-refresh, daemon-stop, user-*,
  *     rate-limited). A real unexpected crash still pages at night.
@@ -34,6 +38,7 @@ const QUIET_SUPPRESSED_TYPES = new Set([
   'user-disable',
   'user-stop',
   'rate-limited',
+  'claude-api-error',
 ]);
 
 function isQuietHoursLA(now: Date): boolean {
@@ -140,6 +145,35 @@ export function notifyAgents(opts: {
         );
       }
     } catch { /* best-effort, never throw */ }
+  }
+}
+
+/**
+ * Scan stdout.log for transient Claude API/backend failures that can make the
+ * Claude Code session exit even though the cortextOS agent process is healthy
+ * and will immediately resume. Deliberately does NOT match plain
+ * "401 Invalid authentication credentials" because an expired OAuth token is a
+ * real operator-actionable fault and should still alert as a crash/auth issue.
+ */
+export function detectClaudeApiTransientInLog(logPath: string): string | null {
+  try {
+    const size = statSync(logPath).size;
+    const readBytes = Math.min(size, 200 * 1024);
+    const fd = readFileSync(logPath);
+    const slice = fd.slice(Math.max(0, fd.length - readBytes)).toString('utf-8');
+    const text = slice.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').toLowerCase();
+    if (/api error:\s*(502|503|504)\b/.test(text) || text.includes('bad gateway')) {
+      return 'claude api transient 5xx detected in stdout.log';
+    }
+    if (text.includes('socket connection was closed unexpectedly')) {
+      return 'claude api socket closed unexpectedly in stdout.log';
+    }
+    if (text.includes('connection reset by peer') || text.includes('econnreset')) {
+      return 'claude api connection reset detected in stdout.log';
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -310,6 +344,12 @@ async function main(): Promise<void> {
     if (existsSync(stdoutPath) && detectRateLimitInLog(stdoutPath)) {
       endType = 'rate-limited';
       reason = 'anthropic rate limit detected in stdout.log';
+    } else if (existsSync(stdoutPath)) {
+      const transientReason = detectClaudeApiTransientInLog(stdoutPath);
+      if (transientReason) {
+        endType = 'claude-api-error';
+        reason = transientReason;
+      }
     }
   }
 

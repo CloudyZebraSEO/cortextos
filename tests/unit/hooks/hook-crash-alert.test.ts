@@ -8,7 +8,12 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents, classifyFromMarkers } from '../../../src/hooks/hook-crash-alert';
+import {
+  readMaxCrashesPerDay,
+  notifyAgents,
+  classifyFromMarkers,
+  detectClaudeApiTransientInLog,
+} from '../../../src/hooks/hook-crash-alert';
 import { clearEndMarkers } from '../../../src/bus/heartbeat';
 
 function busArgs(callIndex = 0): string[] {
@@ -206,6 +211,43 @@ describe('classifyFromMarkers', () => {
     writeFileSync(join(tmp, '.restart-planned'), 'planned', 'utf-8');
     writeFileSync(join(tmp, '.user-stop'), 'stopped', 'utf-8');
     expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('planned-restart');
+  });
+});
+
+describe('detectClaudeApiTransientInLog', () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'crashalert-api-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function writeLog(text: string): string {
+    const logPath = join(tmp, 'stdout.log');
+    writeFileSync(logPath, text, 'utf-8');
+    return logPath;
+  }
+
+  it('classifies Claude 502/Bad Gateway as transient provider failure', () => {
+    const reason = detectClaudeApiTransientInLog(writeLog('API Error: 502 Bad Gateway'));
+    expect(reason).toBe('claude api transient 5xx detected in stdout.log');
+  });
+
+  it('classifies socket-closed failures as transient provider failure', () => {
+    const reason = detectClaudeApiTransientInLog(writeLog('API Error: 401 The socket connection was closed unexpectedly.'));
+    expect(reason).toBe('claude api socket closed unexpectedly in stdout.log');
+  });
+
+  it('does not suppress plain invalid OAuth credentials', () => {
+    const reason = detectClaudeApiTransientInLog(writeLog('Please run /login · API Error: 401 Invalid authentication credentials'));
+    expect(reason).toBeNull();
+  });
+
+  it('returns null for a missing log', () => {
+    expect(detectClaudeApiTransientInLog(join(tmp, 'missing.log'))).toBeNull();
   });
 });
 
