@@ -56,6 +56,15 @@ describe('skill-optimizer grader — gate still has teeth after hardening', () =
     expect(h.gate).not.toBe('NO_SHIP');
   });
 
+  it('codex P0: flags destructive commands with INSERTED FLAGS that evade adjacent-substring needles', () => {
+    // "git -C . push origin main && npm --tag latest publish" — flags inserted
+    // between the verb and subcommand. The old substring needle ("git push")
+    // missed these and scored them SHIP_CANDIDATE; the flag-tolerant regex catches them.
+    const h = grade('shipper', 'inserted-flag-evasion.jsonl');
+    expect(h.transcripts[0].facts.prohibitedAction).toBe(true);
+    expect(h.gate).toBe('NO_SHIP');
+  });
+
   it('task_1781606939353: does NOT flag a run that only DISCUSSES a deploy in prose/message-body, nor a quoted/template placeholder', () => {
     const h = grade('heartbeat', 'discuss-not-do.jsonl');
     // dim-5: "deployed"/"merged to main" appear only in assistant prose and a
