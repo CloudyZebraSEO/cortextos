@@ -62,6 +62,11 @@ interface PollerLiveness {
   sawPollStuck: boolean;
 }
 
+interface ActivityChannelConfig {
+  botToken: string;
+  chatId: string;
+}
+
 interface ManagedAgentEntry {
   process: AgentProcess;
   checker: FastChecker;
@@ -73,6 +78,19 @@ interface ManagedAgentEntry {
   telegramLastRejectAlertAt?: number;
   telegramApi?: TelegramAPI;
   telegramChatId?: string;
+}
+
+function telegramBotId(token: string | undefined): string | undefined {
+  const match = token?.match(/^(\d+):/);
+  return match?.[1];
+}
+
+function sameTelegramBot(left: string | undefined, right: string | undefined): boolean {
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const leftId = telegramBotId(left);
+  const rightId = telegramBotId(right);
+  return !!leftId && leftId === rightId;
 }
 
 /**
@@ -824,6 +842,10 @@ export class AgentManager {
     // running its own poller (only the designated orchestrator agent should poll).
     if (telegramApi && chatId && config.telegram_polling !== false) {
       const stateDir = join(this.ctxRoot, 'state', name);
+      const activityChannelConfig = this.loadActivityChannelConfig(name, resolvedOrg, log);
+      const multiplexActivityChannel = !!activityChannelConfig && sameTelegramBot(botToken, activityChannelConfig.botToken);
+      const isActivityChat = (value: string | number | undefined | null) =>
+        multiplexActivityChannel && String(value ?? '') === activityChannelConfig.chatId;
       let currentPoller = new TelegramPoller(telegramApi, stateDir);
       currentPoller.onApiSuccess = () => this.markPollerApiSuccess(name, 'primary', log, telegramApi, chatId);
       const entry = this.agents.get(name);
@@ -836,6 +858,13 @@ export class AgentManager {
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
       currentPoller.onMessage(async (msg, updateId) => {
+        if (isActivityChat(msg.chat?.id)) {
+          const from = stripControlChars(msg.from?.first_name || msg.from?.username || 'Unknown');
+          const text = stripControlChars(msg.text || msg.caption || '');
+          log(`[activity-channel inbound via primary poller] from ${from}: ${text.slice(0, 120)}`);
+          return;
+        }
+
         // ALLOWED_USER gate: comma-separated list of numeric user IDs.
         // If configured, ignore messages from other users. Always log the
         // rejected user_id + name so operators can discover IDs to whitelist.
@@ -960,6 +989,13 @@ export class AgentManager {
       });
 
       currentPoller.onCallback((query, updateId) => {
+        if (isActivityChat(query.message?.chat?.id)) {
+          checker.handleActivityCallback(query, telegramApi).catch(err => {
+            log(`Activity-channel callback error: ${err}`);
+          });
+          return;
+        }
+
         const callbackKey = telegramCallbackDeliveryKey(query, updateId);
         if (checker.isDuplicate(callbackKey)) {
           log(`Duplicate Telegram callback suppressed (${callbackKey})`);
@@ -973,6 +1009,12 @@ export class AgentManager {
       });
 
       currentPoller.onReaction((reaction, updateId) => {
+        if (isActivityChat(reaction.chat?.id)) {
+          const from = stripControlChars(reaction.user?.first_name || reaction.user?.username || 'Unknown');
+          log(`[activity-channel reaction via primary poller] from ${from}: message=${reaction.message_id}`);
+          return;
+        }
+
         // ALLOWED_USER gate: same multi-user rule as message handler.
         if (allowedUserId) {
           const allowedIds = allowedUserId.split(',').map((s) => parseInt(s.trim(), 10));
@@ -1081,47 +1123,42 @@ export class AgentManager {
 
       log('Telegram poller started (with self-healing restart wrapper)');
 
-      // Orchestrator-only: start a second poller for the org's activity
-      // channel bot so Telegram inline-button callbacks (currently just
-      // appr_allow_*/appr_deny_* from createApproval posts) route to
-      // fast-checker's approval resolver. Polling coupled to orchestrator
-      // lifecycle is a known trade-off accepted in task_1776053707166_292
-      // — follow-up task_1776054009969_099 tracks migrating to a dedicated
-      // singleton or Telegram webhook if the coupling ever causes real
-      // operator pain. Non-orchestrator agents skip this entirely.
-      await this.maybeStartActivityChannelPoller(name, org, agentDir, log);
+      // Orchestrator-only: wire the org activity channel so Telegram
+      // inline-button callbacks (currently just appr_allow_*/appr_deny_*
+      // from createApproval posts) route to fast-checker's approval resolver.
+      // If the activity channel uses this same bot, the primary poller
+      // multiplexes by chat id; if it uses a separate bot, this starts a
+      // dedicated second poller. Non-orchestrator agents skip this entirely.
+      await this.maybeStartActivityChannelPoller(name, resolvedOrg, log, botToken, activityChannelConfig);
     }
   }
 
   /**
    * If this agent is the org's orchestrator AND the org has an
-   * activity-channel.env configured, start a second TelegramPoller bound
-   * to ACTIVITY_BOT_TOKEN. Callbacks route to fast-checker's
-   * handleActivityCallback. Safe no-op in every other case — if the
-   * context.json is missing/corrupt, the orchestrator field is empty,
-   * this agent is not the orchestrator, or the activity-channel.env
-   * is absent/unreadable/missing credentials, this method returns
-   * without starting anything.
+   * activity-channel.env configured, return its bot token + chat id. Safe
+   * no-op in every other case — if context.json is missing/corrupt, the
+   * orchestrator field is empty, this agent is not the orchestrator, or
+   * activity-channel.env is absent/unreadable/missing credentials, this
+   * method returns undefined.
    */
-  private async maybeStartActivityChannelPoller(
+  private loadActivityChannelConfig(
     name: string,
     org: string | undefined,
-    agentDir: string,
     log: LogFn,
-  ): Promise<void> {
-    if (!org) return;
+  ): ActivityChannelConfig | undefined {
+    if (!org) return undefined;
     const orgDir = join(this.frameworkRoot, 'orgs', org);
 
-    // Only the org's orchestrator runs the activity-channel poller.
+    // Only the org's orchestrator handles activity-channel inbound updates.
     let orchestratorName: string | undefined;
     try {
       // stripBom: see src/utils/strip-bom.ts for incident context.
       const contextJson = stripBom(readFileSync(join(orgDir, 'context.json'), 'utf-8'));
       orchestratorName = JSON.parse(contextJson).orchestrator;
     } catch {
-      return; // No context.json or unreadable — skip
+      return undefined; // No context.json or unreadable — skip
     }
-    if (!orchestratorName || orchestratorName !== name) return;
+    if (!orchestratorName || orchestratorName !== name) return undefined;
 
     // Parse activity-channel.env for the separate bot token + chat id.
     const activityEnvPath = join(orgDir, 'activity-channel.env');
@@ -1143,14 +1180,43 @@ export class AgentManager {
         if (key === 'ACTIVITY_CHAT_ID') activityChatId = value;
       }
     } catch {
-      return; // activity-channel.env absent — silent no-op
+      return undefined; // activity-channel.env absent — silent no-op
     }
 
     if (!activityBotToken || !activityChatId) {
-      log('Activity-channel env present but missing BOT_TOKEN or CHAT_ID — skipping poller');
+      log('Activity-channel env present but missing BOT_TOKEN or CHAT_ID — skipping inbound routing');
+      return undefined;
+    }
+
+    return { botToken: activityBotToken, chatId: activityChatId };
+  }
+
+  /**
+   * If the activity channel uses a separate bot token, start its own poller.
+   * If it is configured to use the orchestrator's primary bot token, do NOT
+   * start a second getUpdates consumer: the primary poller already receives
+   * updates for every chat the bot belongs to and routes activity-chat updates
+   * by chat id. Starting a redundant poller against the same bot creates a
+   * Telegram 409 self-conflict loop.
+   */
+  private async maybeStartActivityChannelPoller(
+    name: string,
+    org: string | undefined,
+    log: LogFn,
+    primaryBotToken?: string,
+    loadedConfig?: ActivityChannelConfig,
+  ): Promise<void> {
+    const config = loadedConfig ?? this.loadActivityChannelConfig(name, org, log);
+    if (!config) return;
+
+    if (sameTelegramBot(primaryBotToken, config.botToken)) {
+      const botId = telegramBotId(config.botToken) ?? 'unknown';
+      log(`Activity-channel uses primary bot ${botId}; using primary poller multiplex for chat ${config.chatId} and skipping second getUpdates poller.`);
       return;
     }
 
+    const activityBotToken = config.botToken;
+    const activityChatId = config.chatId;
     const activityApi = new TelegramAPI(activityBotToken);
     const stateDir = join(this.ctxRoot, 'state', name);
     // offsetFileSuffix keeps the activity poller's offset file distinct
