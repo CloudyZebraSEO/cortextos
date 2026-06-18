@@ -67,7 +67,7 @@ export interface CheckUsageResult {
 export interface OAuthTokenSource {
   accessToken: string;
   accountName: string;
-  source: 'accounts.json' | 'env';
+  source: 'accounts.json' | 'credentials-file';
 }
 
 export interface RotateResult {
@@ -95,6 +95,10 @@ function oauthDir(ctxRoot: string): string {
 
 function accountsPath(ctxRoot: string): string {
   return join(oauthDir(ctxRoot), 'accounts.json');
+}
+
+function claudeCredentialsPath(): string {
+  return join(homedir(), '.claude', '.credentials.json');
 }
 
 function usageDir(ctxRoot: string): string {
@@ -141,7 +145,24 @@ export function getActiveAccount(ctxRoot: string): { name: string; account: OAut
   return { name: store.active, account };
 }
 
-export function getAuthoritativeOAuthToken(ctxRoot: string, account?: string): OAuthTokenSource {
+export function readClaudeCredentialsToken(filePath = claudeCredentialsPath()): string | null {
+  if (!existsSync(filePath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as {
+      claudeAiOauth?: { accessToken?: unknown };
+    };
+    const token = parsed.claudeAiOauth?.accessToken;
+    return typeof token === 'string' && token.trim() ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getAuthoritativeOAuthToken(
+  ctxRoot: string,
+  account?: string,
+  credentialsFilePath = claudeCredentialsPath(),
+): OAuthTokenSource {
   if (account) {
     const store = loadAccounts(ctxRoot);
     const acct = store?.accounts[account];
@@ -158,12 +179,18 @@ export function getAuthoritativeOAuthToken(ctxRoot: string, account?: string): O
     };
   }
 
-  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  if (envToken) {
-    return { accessToken: envToken, accountName: 'env', source: 'env' };
+  const credentialsToken = readClaudeCredentialsToken(credentialsFilePath);
+  if (credentialsToken) {
+    return {
+      accessToken: credentialsToken,
+      accountName: 'credentials-file',
+      source: 'credentials-file',
+    };
   }
 
-  throw new Error('No OAuth token available (no accounts.json and CLAUDE_CODE_OAUTH_TOKEN not set)');
+  throw new Error(
+    'No OAuth token available (no accounts.json active token and no ~/.claude/.credentials.json claudeAiOauth.accessToken)',
+  );
 }
 
 // --- Usage cache helpers ---

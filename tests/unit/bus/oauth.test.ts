@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -11,6 +11,7 @@ const {
   loadAccounts,
   getActiveAccount,
   getAuthoritativeOAuthToken,
+  readClaudeCredentialsToken,
   checkUsageApi,
   refreshOAuthToken,
   rotateOAuth,
@@ -50,10 +51,20 @@ let tmpDir: string;
 let originalClaudeToken: string | undefined;
 
 function writeStore(store = SAMPLE_STORE) {
-  const { mkdirSync, writeFileSync } = require('fs');
   const oauthDir = join(tmpDir, 'state', 'oauth');
   mkdirSync(oauthDir, { recursive: true });
   writeFileSync(join(oauthDir, 'accounts.json'), JSON.stringify(store, null, 2));
+}
+
+function credentialsPath(): string {
+  return join(tmpDir, '.claude', '.credentials.json');
+}
+
+function writeCredentials(token = 'credentials_token_good') {
+  const path = credentialsPath();
+  mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+  writeFileSync(path, JSON.stringify({ claudeAiOauth: { accessToken: token } }, null, 2));
+  return path;
 }
 
 beforeEach(() => {
@@ -98,12 +109,27 @@ describe('getActiveAccount', () => {
   });
 });
 
+describe('readClaudeCredentialsToken', () => {
+  it('returns null when credentials file is missing or invalid', () => {
+    expect(readClaudeCredentialsToken(credentialsPath())).toBeNull();
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(credentialsPath(), 'not-json');
+    expect(readClaudeCredentialsToken(credentialsPath())).toBeNull();
+  });
+
+  it('reads claudeAiOauth.accessToken from credentials.json', () => {
+    const path = writeCredentials('credentials_token_good');
+    expect(readClaudeCredentialsToken(path)).toBe('credentials_token_good');
+  });
+});
+
 describe('getAuthoritativeOAuthToken', () => {
   it('prefers accounts.json over a stale process env token', () => {
     writeStore();
+    writeCredentials('credentials_token_good');
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'stale-user-env-token';
 
-    const result = getAuthoritativeOAuthToken(tmpDir);
+    const result = getAuthoritativeOAuthToken(tmpDir, undefined, credentialsPath());
     expect(result).toEqual({
       accessToken: 'tok_primary_abc',
       accountName: 'primary',
@@ -113,28 +139,30 @@ describe('getAuthoritativeOAuthToken', () => {
 
   it('uses a named account from accounts.json before env', () => {
     writeStore();
+    writeCredentials('credentials_token_good');
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'stale-user-env-token';
 
-    const result = getAuthoritativeOAuthToken(tmpDir, 'secondary');
+    const result = getAuthoritativeOAuthToken(tmpDir, 'secondary', credentialsPath());
     expect(result.accessToken).toBe('tok_secondary_def');
     expect(result.accountName).toBe('secondary');
     expect(result.source).toBe('accounts.json');
   });
 
-  it('falls back to env only when no accounts.json exists', () => {
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'env-token';
+  it('uses credentials.json when accounts.json is absent and ignores stale env', () => {
+    writeCredentials('credentials_token_good');
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'stale-user-env-token';
 
-    const result = getAuthoritativeOAuthToken(tmpDir);
+    const result = getAuthoritativeOAuthToken(tmpDir, undefined, credentialsPath());
     expect(result).toEqual({
-      accessToken: 'env-token',
-      accountName: 'env',
-      source: 'env',
+      accessToken: 'credentials_token_good',
+      accountName: 'credentials-file',
+      source: 'credentials-file',
     });
   });
 
-  it('throws when no file token and daemon env has been scrubbed', () => {
-    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    expect(() => getAuthoritativeOAuthToken(tmpDir)).toThrow('No OAuth token available');
+  it('throws instead of falling back to process env when no file token exists', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'stale-user-env-token';
+    expect(() => getAuthoritativeOAuthToken(tmpDir, undefined, credentialsPath())).toThrow('No OAuth token available');
   });
 });
 
