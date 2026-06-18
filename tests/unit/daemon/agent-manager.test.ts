@@ -9,9 +9,11 @@ const mockRuntime = vi.hoisted(() => ({
     seen: Set<string>;
     queued: string[];
     callbacks: unknown[];
+    activityCallbacks: unknown[];
     isDuplicate: (text: string) => boolean;
     queueTelegramMessage: (formatted: string) => void;
     handleCallback: (query: unknown) => Promise<void>;
+    handleActivityCallback: (query: unknown) => Promise<void>;
     start: () => Promise<void>;
     stop: () => void;
     wake: () => void;
@@ -54,6 +56,7 @@ vi.mock('../../../src/daemon/fast-checker.js', () => ({
     seen = new Set<string>();
     queued: string[] = [];
     callbacks: unknown[] = [];
+    activityCallbacks: unknown[] = [];
     constructor() {
       mockRuntime.checkers.push(this);
     }
@@ -67,6 +70,9 @@ vi.mock('../../../src/daemon/fast-checker.js', () => ({
     }
     async handleCallback(query: unknown) {
       this.callbacks.push(query);
+    }
+    async handleActivityCallback(query: unknown) {
+      this.activityCallbacks.push(query);
     }
     async start() { /* no-op */ }
     stop() { /* no-op */ }
@@ -488,6 +494,124 @@ describe('AgentManager Telegram inbound delivery-id dedup', () => {
 
     expect(checker.callbacks).toHaveLength(1);
     expect(checker.queued).toHaveLength(1);
+  });
+});
+
+describe('AgentManager activity-channel Telegram multiplex', () => {
+  let testDir: string;
+  let instanceId: string;
+  let managerCtxRoot: string;
+  let ctxRootOnDisk: string;
+  let frameworkRoot: string;
+  let agentDir: string;
+  let am: InstanceType<typeof AgentManager>;
+
+  beforeEach(() => {
+    mockRuntime.checkers.length = 0;
+    mockRuntime.pollers.length = 0;
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-activity-mux-'));
+    instanceId = `activity-mux-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    managerCtxRoot = join(testDir, 'instance');
+    ctxRootOnDisk = join(homedir(), '.cortextos', instanceId);
+    frameworkRoot = join(testDir, 'framework');
+    agentDir = join(frameworkRoot, 'orgs', 'acme', 'agents', 'aurex');
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme'), { recursive: true });
+    writeFileSync(join(frameworkRoot, 'orgs', 'acme', 'context.json'), JSON.stringify({ orchestrator: 'aurex' }));
+    writeFileSync(
+      join(agentDir, '.env'),
+      [
+        'BOT_TOKEN=8749429488:PRIMARY_secret',
+        'CHAT_ID=1536425742',
+        'ALLOWED_USER=42',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  afterEach(async () => {
+    await am?.stopAgent('aurex').catch(() => undefined);
+    rmSync(testDir, { recursive: true, force: true });
+    rmSync(ctxRootOnDisk, { recursive: true, force: true });
+  });
+
+  function writeActivityEnv(token: string) {
+    writeFileSync(
+      join(frameworkRoot, 'orgs', 'acme', 'activity-channel.env'),
+      [
+        `ACTIVITY_BOT_TOKEN=${token}`,
+        'ACTIVITY_CHAT_ID=-1004304770441',
+        '',
+      ].join('\n'),
+    );
+  }
+
+  it('does not start a second getUpdates poller when activity channel uses the primary bot', async () => {
+    writeActivityEnv('8749429488:PRIMARY_secret');
+    am = new AgentManager(instanceId, managerCtxRoot, frameworkRoot, 'acme');
+
+    await am.startAgent('aurex', agentDir, { runtime: 'hermes' } as any, 'acme');
+
+    expect(mockRuntime.pollers).toHaveLength(1);
+  });
+
+  it('does not start a second poller when activity token has the same bot id with a rotated secret', async () => {
+    writeActivityEnv('8749429488:ROTATED_secret');
+    am = new AgentManager(instanceId, managerCtxRoot, frameworkRoot, 'acme');
+
+    await am.startAgent('aurex', agentDir, { runtime: 'hermes' } as any, 'acme');
+
+    expect(mockRuntime.pollers).toHaveLength(1);
+  });
+
+  it('logs same-bot activity chat messages without injecting them into the agent', async () => {
+    writeActivityEnv('8749429488:PRIMARY_secret');
+    am = new AgentManager(instanceId, managerCtxRoot, frameworkRoot, 'acme');
+    await am.startAgent('aurex', agentDir, { runtime: 'hermes' } as any, 'acme');
+    const poller = mockRuntime.pollers.at(-1)!;
+    const checker = mockRuntime.checkers.at(-1)!;
+
+    await poller.messageHandler!(
+      {
+        message_id: 1,
+        from: { id: 42, first_name: 'Steven' },
+        chat: { id: -1004304770441 },
+        text: 'activity chatter',
+      },
+      9901,
+    );
+
+    expect(checker.queued).toEqual([]);
+  });
+
+  it('routes same-bot activity callbacks to the activity callback handler', async () => {
+    writeActivityEnv('8749429488:PRIMARY_secret');
+    am = new AgentManager(instanceId, managerCtxRoot, frameworkRoot, 'acme');
+    await am.startAgent('aurex', agentDir, { runtime: 'hermes' } as any, 'acme');
+    const poller = mockRuntime.pollers.at(-1)!;
+    const checker = mockRuntime.checkers.at(-1)!;
+
+    await poller.callbackHandler!(
+      {
+        id: 'cb-activity',
+        from: { id: 42, first_name: 'Steven' },
+        message: { chat: { id: -1004304770441 }, message_id: 10 },
+        data: 'appr_allow_approval_1780000000000_abcd',
+      },
+      9902,
+    );
+
+    expect(checker.activityCallbacks).toHaveLength(1);
+    expect(checker.callbacks).toHaveLength(0);
+  });
+
+  it('still starts a dedicated activity poller for a genuinely separate activity bot', async () => {
+    writeActivityEnv('9999999999:ACTIVITY_secret');
+    am = new AgentManager(instanceId, managerCtxRoot, frameworkRoot, 'acme');
+
+    await am.startAgent('aurex', agentDir, { runtime: 'hermes' } as any, 'acme');
+
+    expect(mockRuntime.pollers).toHaveLength(2);
   });
 });
 
