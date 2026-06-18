@@ -92,32 +92,36 @@ describe('AgentPTY auth-token hardening (INCIDENT 2026-06-17)', () => {
     expect(Object.keys(env).filter((k) => k.toUpperCase() === 'CLAUDE_CODE_OAUTH_TOKEN')).toHaveLength(1);
   });
 
-  it('logs the auth source with a redacted last-8 tail and never the full token', async () => {
+  it('WARNS that a .env override is DEPRECATED, with a redacted tail and never the full token', async () => {
     files[agentEnvPath] = 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-SECRETSECRETrwE3LQAA\n';
-    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const { pty } = spawnWith();
     await pty.spawn('fresh', 'PROMPT');
 
-    const line = log.mock.calls.map((c) => String(c[0])).find((s) => s.includes('Claude OAuth token source='));
+    const line = warn.mock.calls.map((c) => String(c[0])).find((s) => s.includes('DEPRECATED static .env'));
     expect(line).toBeTruthy();
-    expect(line).toContain('source=agent-env');
     expect(line).toContain('…rwE3LQAA');
+    expect(line).toContain('stale'); // explains the pin-and-go-stale risk
     expect(line).not.toContain('sk-ant-SECRETSECRET');
-    log.mockRestore();
+    warn.mockRestore();
   });
 
-  it('warns (does not crash) when no authoritative token exists anywhere', async () => {
-    // no .env token, no credential store file in the virtual fs
+  it('injects NOTHING by default (no .env token) so Claude reads credentials.json natively', async () => {
+    // no .env token → credentials-native default. Even a stale process.env value
+    // must not leak into the child env.
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'STALE-USER-SCOPE-rwE3LQAA';
     files[agentEnvPath] = 'BOT_TOKEN=bt\n';
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
     const { pty, captured } = spawnWith();
     await expect(pty.spawn('fresh', 'PROMPT')).resolves.toBeUndefined();
 
     const env = captured[0].opts.env;
+    // ZERO token keys of any case variant in the child env (proves non-injection)
     expect(Object.keys(env).filter((k) => k.toUpperCase() === 'CLAUDE_CODE_OAUTH_TOKEN')).toHaveLength(0);
-    expect(warn.mock.calls.some((c) => String(c[0]).includes('no authoritative Claude OAuth token'))).toBe(true);
-    warn.mockRestore();
+    expect(Object.values(env)).not.toContain('STALE-USER-SCOPE-rwE3LQAA');
+    expect(log.mock.calls.some((c) => String(c[0]).includes('no OAuth token injected'))).toBe(true);
+    log.mockRestore();
   });
 });

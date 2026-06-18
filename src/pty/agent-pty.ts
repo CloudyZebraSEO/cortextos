@@ -162,29 +162,31 @@ export class AgentPTY {
       } catch { /* leave unset if context.json is missing or malformed */ }
     }
 
-    // --- Auth-token canonicalization (defense-in-depth; INCIDENT 2026-06-17) ---
-    // The agent .env token is authoritative; the Claude credential store is the
-    // explicit fallback. Strip EVERY inherited case variant of the OAuth token
-    // first so no stale daemon / User-scope value can shadow it, then set
-    // exactly one canonical key from the authoritative source. A spawn-time
-    // assertion hard-fails rather than booting an agent onto a wrong/stale token
-    // (a bad token here 401'd the whole Claude fleet for >1 day). The token is
-    // never sourced from process.env / inherited env — that was the bug vector.
+    // --- Auth-token hardening (defense-in-depth; INCIDENTS 2026-06-17 + 06-18) ---
+    // Strip EVERY inherited case variant of the OAuth token so no stale daemon /
+    // User-scope value can shadow the credential store, then inject NOTHING by
+    // default: `claude` reads and refreshes ~/.claude/.credentials.json natively
+    // (rotation-proof). A static token is injected ONLY when the agent .env
+    // carries one as a deliberate, DEPRECATED override — that pins a snapshot
+    // which goes stale on the next OAuth rotation (the 06-18 recurrence). The
+    // token is never sourced from process.env / inherited env. A spawn-time
+    // assertion hard-fails (not silently 401s the fleet) on any leak/mismatch.
     stripOAuthTokenVariants(ptyEnv);
     const resolvedToken = resolveCanonicalToken(agentEnvToken);
     if (resolvedToken.token) {
       ptyEnv[OAUTH_TOKEN_KEY] = resolvedToken.token;
     }
     assertChildAuthToken(ptyEnv, resolvedToken);
-    if (resolvedToken.source === 'none') {
+    if (resolvedToken.source === 'agent-env-override') {
       console.warn(
-        `[agent-pty] ${this.env.agentName}: no authoritative Claude OAuth token ` +
-        `(no .env token, no credential store) — agent may need /login`,
+        `[agent-pty] ${this.env.agentName}: using DEPRECATED static .env CLAUDE_CODE_OAUTH_TOKEN ` +
+        `(tail=${redactToken(resolvedToken.token)}). A pinned token cannot refresh and WILL go stale ` +
+        `on the next OAuth rotation — remove it to use the auto-refreshing credential store.`,
       );
     } else {
       console.log(
-        `[agent-pty] ${this.env.agentName}: Claude OAuth token source=${resolvedToken.source} ` +
-        `tail=${redactToken(resolvedToken.token)} (redacted, last-8 only)`,
+        `[agent-pty] ${this.env.agentName}: no OAuth token injected — Claude will read+refresh ` +
+        `~/.claude/.credentials.json natively (rotation-proof).`,
       );
     }
 

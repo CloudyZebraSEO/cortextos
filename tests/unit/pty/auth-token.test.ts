@@ -95,25 +95,24 @@ describe('readClaudeCredentialsToken (shared reader)', () => {
   });
 });
 
-describe('resolveCanonicalToken — authoritative-first, never inherited', () => {
-  it('prefers the agent .env token (source agent-env)', () => {
-    files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: 'file-tok' } });
-    expect(resolveCanonicalToken('env-tok', credPath)).toEqual({ token: 'env-tok', source: 'agent-env' });
+describe('resolveCanonicalToken — inject nothing by default, never inherited', () => {
+  it('returns agent-env-override (with the token) ONLY when .env carries a token', () => {
+    expect(resolveCanonicalToken('env-tok')).toEqual({ token: 'env-tok', source: 'agent-env-override' });
   });
-  it('falls back to the credential store when .env has no token', () => {
-    files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: 'file-tok' } });
-    expect(resolveCanonicalToken(undefined, credPath)).toEqual({ token: 'file-tok', source: 'credentials-file' });
+  it('returns credentials-native with NO token when .env has no token', () => {
+    expect(resolveCanonicalToken(undefined)).toEqual({ source: 'credentials-native' });
+    expect(resolveCanonicalToken('')).toEqual({ source: 'credentials-native' });
   });
-  it('resolves to none when neither source has a token', () => {
-    expect(resolveCanonicalToken(undefined, credPath)).toEqual({ source: 'none' });
-    expect(resolveCanonicalToken('', credPath)).toEqual({ source: 'none' });
-  });
-  it('NEVER reads process.env even when a stale value is present', () => {
+  it('NEVER reads process.env, and NEVER reads/injects a credential-store snapshot', () => {
     const prev = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'STALE-USER-SCOPE';
+    files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: 'valid-file-token' } });
     try {
-      // no .env token, no credential file → must be none, NOT the process.env value
-      expect(resolveCanonicalToken(undefined, credPath)).toEqual({ source: 'none' });
+      // Even with a valid credential file present, the default injects NOTHING —
+      // claude must read+refresh credentials.json natively (the inject-nothing fix).
+      const r = resolveCanonicalToken(undefined);
+      expect(r).toEqual({ source: 'credentials-native' });
+      expect(r.token).toBeUndefined();
     } finally {
       if (prev === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
       else process.env.CLAUDE_CODE_OAUTH_TOKEN = prev;
@@ -121,33 +120,37 @@ describe('resolveCanonicalToken — authoritative-first, never inherited', () =>
   });
 });
 
-describe('assertChildAuthToken — spawn-time invariant', () => {
-  it('passes when child env carries exactly the resolved canonical token', () => {
+describe('assertChildAuthToken — spawn-time invariant (inverted: proves non-injection)', () => {
+  it('credentials-native PASSES when the child env carries NO token at all (proves non-injection)', () => {
+    expect(() => assertChildAuthToken({ PATH: '/x' }, { source: 'credentials-native' })).not.toThrow();
+  });
+  it('credentials-native THROWS when any token leaked into the child env', () => {
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: 'leaked-inherited' };
+    expect(() => assertChildAuthToken(env, { source: 'credentials-native' })).toThrow(/refusing to spawn/);
+  });
+  it('credentials-native THROWS on a leaked lowercase case variant too', () => {
+    const env: Record<string, string | undefined> = { claude_code_oauth_token: 'leaked-lower' };
+    expect(() => assertChildAuthToken(env, { source: 'credentials-native' })).toThrow(/refusing to spawn/);
+  });
+  it('agent-env-override PASSES when child env carries exactly the override token', () => {
     const env = { PATH: '/x', CLAUDE_CODE_OAUTH_TOKEN: 'good' };
-    expect(() => assertChildAuthToken(env, { token: 'good', source: 'agent-env' })).not.toThrow();
+    expect(() => assertChildAuthToken(env, { token: 'good', source: 'agent-env-override' })).not.toThrow();
   });
-  it('throws when the child token does NOT match the authoritative token', () => {
+  it('agent-env-override THROWS when the child token does NOT match the override', () => {
     const env = { CLAUDE_CODE_OAUTH_TOKEN: 'STALE' };
-    expect(() => assertChildAuthToken(env, { token: 'good', source: 'agent-env' })).toThrow(/does not match/);
+    expect(() => assertChildAuthToken(env, { token: 'good', source: 'agent-env-override' })).toThrow(/does not match/);
   });
-  it('throws (and does not leak) when a stale case variant survives alongside the canonical key', () => {
+  it('agent-env-override THROWS when a stale case variant survives alongside the canonical key', () => {
     const env: Record<string, string | undefined> = {
       CLAUDE_CODE_OAUTH_TOKEN: 'good',
       claude_code_oauth_token: 'STALE',
     };
-    expect(() => assertChildAuthToken(env, { token: 'good', source: 'agent-env' })).toThrow(/exactly one canonical/);
-  });
-  it('throws when no token resolved but one leaked into the child env', () => {
-    const env = { CLAUDE_CODE_OAUTH_TOKEN: 'leaked-inherited' };
-    expect(() => assertChildAuthToken(env, { source: 'none' })).toThrow(/refusing to spawn/);
-  });
-  it('passes for source none when the child env carries no token at all', () => {
-    expect(() => assertChildAuthToken({ PATH: '/x' }, { source: 'none' })).not.toThrow();
+    expect(() => assertChildAuthToken(env, { token: 'good', source: 'agent-env-override' })).toThrow(/exactly one canonical/);
   });
   it('never includes the raw token in the thrown message', () => {
     const env = { CLAUDE_CODE_OAUTH_TOKEN: 'STALE-SECRET-VALUE-12345678' };
     try {
-      assertChildAuthToken(env, { token: 'good-secret-87654321', source: 'agent-env' });
+      assertChildAuthToken(env, { token: 'good-secret-87654321', source: 'agent-env-override' });
       throw new Error('expected throw');
     } catch (e) {
       const msg = (e as Error).message;

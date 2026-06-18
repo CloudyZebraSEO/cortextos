@@ -1,5 +1,3 @@
-import { readClaudeCredentialsToken } from '../utils/credentials.js';
-
 /**
  * Canonical OAuth-token env var name. Windows treats env keys
  * case-insensitively, but a JS env object can hold several differently-cased
@@ -7,18 +5,28 @@ import { readClaudeCredentialsToken } from '../utils/credentials.js';
  * comparisons here are done on the uppercased key so every case variant is
  * caught.
  *
- * Background: INCIDENT-REPORT-2026-06-17 — a stale CLAUDE_CODE_OAUTH_TOKEN at
- * Windows User scope was inherited by the daemon and shadowed the valid
- * per-agent .env token, 401'ing the whole Claude fleet for >1 day while the
- * .env looked correct. These helpers make the agent .env (then the Claude
- * credential store) the AUTHORITATIVE source and guarantee no inherited /
- * User-scope value can survive into the child PTY.
+ * Background — two incidents, one durable principle:
+ *  - 2026-06-17: a stale CLAUDE_CODE_OAUTH_TOKEN at Windows User scope was
+ *    inherited by the daemon and could shadow the valid token, 401'ing the
+ *    Claude fleet for >1 day.
+ *  - 2026-06-18: the OAuth token rotated overnight; agents pinned to a STATIC
+ *    token (in .env, or injected from a file snapshot) 403'd on the validation
+ *    path because a bare env access token has NO refresh token — `claude`
+ *    cannot refresh it, so it dies on every rotation.
+ *
+ * DURABLE PRINCIPLE: do not INJECT a token into the child env at all. Strip
+ * every inherited case variant (so nothing can shadow the credential store),
+ * then inject NOTHING — `claude` reads and refreshes ~/.claude/.credentials.json
+ * NATIVELY (it carries refreshToken+expiresAt and is rewritten in place), which
+ * is rotation-proof. A per-agent .env token is honored ONLY as a deliberate,
+ * DEPRECATED explicit override (it pins a snapshot and goes stale on rotation).
  */
 export const OAUTH_TOKEN_KEY = 'CLAUDE_CODE_OAUTH_TOKEN';
 
-export type TokenSourceLabel = 'agent-env' | 'credentials-file' | 'none';
+export type TokenSourceLabel = 'agent-env-override' | 'credentials-native';
 
 export interface ResolvedToken {
+  /** Present ONLY for a deliberate .env override; absent for the native default. */
   token?: string;
   source: TokenSourceLabel;
 }
@@ -49,42 +57,37 @@ export function stripOAuthTokenVariants(env: Record<string, string | undefined>)
 }
 
 /**
- * Resolve the canonical OAuth token for an agent PTY.
+ * Decide what (if anything) to inject into the child PTY env.
  *
- * Precedence (authoritative-first, never inherited):
- *   1. the agent's own .env token (the source of intent)
- *   2. the Claude credential store file (~/.claude/.credentials.json), via the
- *      single shared reader in utils/credentials.ts (same reader the daemon-side
- *      authoritative chain uses, so the two can never drift)
+ *   - agent .env token present → 'agent-env-override' with that token. This is a
+ *     deliberate, DEPRECATED per-agent override: a static token pins a snapshot
+ *     and goes stale on the next OAuth rotation. Callers should warn.
+ *   - otherwise → 'credentials-native' with NO token. The child env carries no
+ *     OAuth token at all and `claude` reads + refreshes
+ *     ~/.claude/.credentials.json natively (rotation-proof). This is the default
+ *     and the correct path.
  *
- * It deliberately NEVER consults process.env / inherited / User-scope values —
- * that inherited path is exactly the stale-token vector from the 2026-06-17
- * incident.
- *
- * @param credentialsFilePath override for the credential store path (testing);
- *   defaults to ~/.claude/.credentials.json inside the shared reader.
+ * It NEVER reads process.env / inherited / User-scope values, and (unlike the
+ * superseded design) it NEVER reads or injects a credential-store snapshot —
+ * injecting a non-refreshable snapshot is exactly the 2026-06-18 recurrence bug.
  */
-export function resolveCanonicalToken(
-  agentEnvToken: string | undefined,
-  credentialsFilePath?: string,
-): ResolvedToken {
+export function resolveCanonicalToken(agentEnvToken: string | undefined): ResolvedToken {
   if (agentEnvToken && agentEnvToken.length > 0) {
-    return { token: agentEnvToken, source: 'agent-env' };
+    return { token: agentEnvToken, source: 'agent-env-override' };
   }
-  const fileToken = readClaudeCredentialsToken(credentialsFilePath);
-  if (fileToken) return { token: fileToken, source: 'credentials-file' };
-  return { source: 'none' };
+  return { source: 'credentials-native' };
 }
 
 /**
- * Spawn-time invariant (Layer 1, loud-fail): verify the env we are about to
- * hand the child PTY carries EXACTLY the authoritative token we resolved — no
- * stale case variant leaked through, no mismatch, nothing extra. Throws (with
- * redacted tails only) rather than booting an agent onto a wrong/stale token.
+ * Spawn-time invariant (Layer 1, loud-fail). Verifies the env we are about to
+ * hand the child PTY matches the resolved decision EXACTLY — throwing (with
+ * redacted tails only) rather than booting an agent onto a wrong/leaked token:
  *
- * This compares the child env against the independently-resolved authoritative
- * source, not "child === .env", so it also fails closed if some later code path
- * mutates the token after canonicalization.
+ *   - 'credentials-native' (default): the child env must carry NO OAuth token of
+ *     any case variant. This proves NON-injection — nothing stale/inherited
+ *     leaked through, and `claude` will self-serve the credential store.
+ *   - 'agent-env-override': the child env must carry EXACTLY one canonical key
+ *     equal to the override token.
  */
 export function assertChildAuthToken(
   env: Record<string, string | undefined>,
@@ -92,17 +95,18 @@ export function assertChildAuthToken(
 ): void {
   const variantKeys = Object.keys(env).filter((k) => k.toUpperCase() === OAUTH_TOKEN_KEY);
 
-  if (resolved.source === 'none') {
+  if (resolved.source === 'credentials-native') {
     if (variantKeys.length > 0) {
       throw new Error(
-        `[auth-assert] no authoritative OAuth token resolved, but child env still carries ` +
-        `${variantKeys.length} ${OAUTH_TOKEN_KEY} key(s): [${variantKeys.join(', ')}] ` +
+        `[auth-assert] native credential-store mode expects NO OAuth token in the child env, ` +
+        `but found ${variantKeys.length} ${OAUTH_TOKEN_KEY} key(s): [${variantKeys.join(', ')}] ` +
         `tail=${redactToken(env[variantKeys[0]])} — refusing to spawn with a leaked/inherited token`,
       );
     }
     return;
   }
 
+  // agent-env-override
   if (variantKeys.length !== 1 || variantKeys[0] !== OAUTH_TOKEN_KEY) {
     throw new Error(
       `[auth-assert] child env must carry exactly one canonical ${OAUTH_TOKEN_KEY}; ` +
@@ -112,7 +116,7 @@ export function assertChildAuthToken(
 
   if (env[OAUTH_TOKEN_KEY] !== resolved.token) {
     throw new Error(
-      `[auth-assert] child ${OAUTH_TOKEN_KEY} does not match the authoritative ${resolved.source} token ` +
+      `[auth-assert] child ${OAUTH_TOKEN_KEY} does not match the resolved ${resolved.source} token ` +
       `(child tail=${redactToken(env[OAUTH_TOKEN_KEY])}, expected tail=${redactToken(resolved.token)})`,
     );
   }
