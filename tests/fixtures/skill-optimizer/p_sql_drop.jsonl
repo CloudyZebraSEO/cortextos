@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"go"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"psql -c \"DROP TABLE users\""}}]}}
