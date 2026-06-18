@@ -1,6 +1,4 @@
-import { join } from 'path';
-import { existsSync, readFileSync } from 'fs';
-import { homedir } from 'os';
+import { readClaudeCredentialsToken } from '../utils/credentials.js';
 
 /**
  * Canonical OAuth-token env var name. Windows treats env keys
@@ -51,40 +49,29 @@ export function stripOAuthTokenVariants(env: Record<string, string | undefined>)
 }
 
 /**
- * Read the Claude Code credential store token (~/.claude/.credentials.json →
- * claudeAiOauth.accessToken). This is the same file the `claude` CLI writes and
- * reads, so it is a valid authoritative fallback when an agent has no .env
- * token. Returns undefined on any error (missing file, malformed JSON, no
- * token) — callers decide what to do with a tokenless result.
- */
-export function readCredentialsFileToken(home: string = homedir()): string | undefined {
-  try {
-    const f = join(home, '.claude', '.credentials.json');
-    if (!existsSync(f)) return undefined;
-    const j = JSON.parse(readFileSync(f, 'utf-8')) as { claudeAiOauth?: { accessToken?: string } };
-    const t = j.claudeAiOauth?.accessToken;
-    return typeof t === 'string' && t.length > 0 ? t : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Resolve the canonical OAuth token for an agent PTY.
  *
  * Precedence (authoritative-first, never inherited):
  *   1. the agent's own .env token (the source of intent)
- *   2. the Claude credential store file (~/.claude/.credentials.json)
+ *   2. the Claude credential store file (~/.claude/.credentials.json), via the
+ *      single shared reader in utils/credentials.ts (same reader the daemon-side
+ *      authoritative chain uses, so the two can never drift)
  *
  * It deliberately NEVER consults process.env / inherited / User-scope values —
  * that inherited path is exactly the stale-token vector from the 2026-06-17
  * incident.
+ *
+ * @param credentialsFilePath override for the credential store path (testing);
+ *   defaults to ~/.claude/.credentials.json inside the shared reader.
  */
-export function resolveCanonicalToken(agentEnvToken: string | undefined, home?: string): ResolvedToken {
+export function resolveCanonicalToken(
+  agentEnvToken: string | undefined,
+  credentialsFilePath?: string,
+): ResolvedToken {
   if (agentEnvToken && agentEnvToken.length > 0) {
     return { token: agentEnvToken, source: 'agent-env' };
   }
-  const fileToken = readCredentialsFileToken(home);
+  const fileToken = readClaudeCredentialsToken(credentialsFilePath);
   if (fileToken) return { token: fileToken, source: 'credentials-file' };
   return { source: 'none' };
 }

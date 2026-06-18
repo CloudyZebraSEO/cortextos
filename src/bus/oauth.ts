@@ -14,8 +14,12 @@
 
 import { existsSync, readFileSync, chmodSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { claudeCredentialsPath, readClaudeCredentialsToken } from '../utils/credentials.js';
+
+// Re-exported so existing importers (and tests) can keep sourcing the single
+// shared credential-store reader from this module.
+export { readClaudeCredentialsToken } from '../utils/credentials.js';
 
 // --- Types ---
 
@@ -97,10 +101,6 @@ function accountsPath(ctxRoot: string): string {
   return join(oauthDir(ctxRoot), 'accounts.json');
 }
 
-function claudeCredentialsPath(): string {
-  return join(homedir(), '.claude', '.credentials.json');
-}
-
 function usageDir(ctxRoot: string): string {
   return join(ctxRoot, 'state', 'usage');
 }
@@ -143,19 +143,6 @@ export function getActiveAccount(ctxRoot: string): { name: string; account: OAut
   const account = store.accounts[store.active];
   if (!account) return null;
   return { name: store.active, account };
-}
-
-export function readClaudeCredentialsToken(filePath = claudeCredentialsPath()): string | null {
-  if (!existsSync(filePath)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as {
-      claudeAiOauth?: { accessToken?: unknown };
-    };
-    const token = parsed.claudeAiOauth?.accessToken;
-    return typeof token === 'string' && token.trim() ? token : null;
-  } catch {
-    return null;
-  }
 }
 
 export function getAuthoritativeOAuthToken(

@@ -20,10 +20,12 @@ const {
   OAUTH_TOKEN_KEY,
   redactToken,
   stripOAuthTokenVariants,
-  readCredentialsFileToken,
   resolveCanonicalToken,
   assertChildAuthToken,
 } = await import('../../../src/pty/auth-token.js');
+// The single shared credential-store reader (utils/credentials.ts) — exercised
+// here from the PTY side; bus/oauth.ts exercises the same reader on its side.
+const { readClaudeCredentialsToken } = await import('../../../src/utils/credentials.js');
 
 const HOME = '/home/tester';
 const credPath = join(HOME, '.claude', '.credentials.json');
@@ -71,45 +73,47 @@ describe('stripOAuthTokenVariants', () => {
   });
 });
 
-describe('readCredentialsFileToken', () => {
+describe('readClaudeCredentialsToken (shared reader)', () => {
   it('reads claudeAiOauth.accessToken from ~/.claude/.credentials.json', () => {
     files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: 'valid-from-file' } });
-    expect(readCredentialsFileToken(HOME)).toBe('valid-from-file');
+    expect(readClaudeCredentialsToken(credPath)).toBe('valid-from-file');
   });
-  it('returns undefined when the file is missing', () => {
-    expect(readCredentialsFileToken(HOME)).toBeUndefined();
+  it('returns null when the file is missing', () => {
+    expect(readClaudeCredentialsToken(credPath)).toBeNull();
   });
-  it('returns undefined on malformed JSON', () => {
+  it('returns null on malformed JSON', () => {
     files[credPath] = '{ not json';
-    expect(readCredentialsFileToken(HOME)).toBeUndefined();
+    expect(readClaudeCredentialsToken(credPath)).toBeNull();
   });
-  it('returns undefined when accessToken is absent/empty', () => {
+  it('returns null when accessToken is absent/empty/blank', () => {
     files[credPath] = JSON.stringify({ claudeAiOauth: {} });
-    expect(readCredentialsFileToken(HOME)).toBeUndefined();
+    expect(readClaudeCredentialsToken(credPath)).toBeNull();
     files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: '' } });
-    expect(readCredentialsFileToken(HOME)).toBeUndefined();
+    expect(readClaudeCredentialsToken(credPath)).toBeNull();
+    files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: '   ' } });
+    expect(readClaudeCredentialsToken(credPath)).toBeNull();
   });
 });
 
 describe('resolveCanonicalToken — authoritative-first, never inherited', () => {
   it('prefers the agent .env token (source agent-env)', () => {
     files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: 'file-tok' } });
-    expect(resolveCanonicalToken('env-tok', HOME)).toEqual({ token: 'env-tok', source: 'agent-env' });
+    expect(resolveCanonicalToken('env-tok', credPath)).toEqual({ token: 'env-tok', source: 'agent-env' });
   });
   it('falls back to the credential store when .env has no token', () => {
     files[credPath] = JSON.stringify({ claudeAiOauth: { accessToken: 'file-tok' } });
-    expect(resolveCanonicalToken(undefined, HOME)).toEqual({ token: 'file-tok', source: 'credentials-file' });
+    expect(resolveCanonicalToken(undefined, credPath)).toEqual({ token: 'file-tok', source: 'credentials-file' });
   });
   it('resolves to none when neither source has a token', () => {
-    expect(resolveCanonicalToken(undefined, HOME)).toEqual({ source: 'none' });
-    expect(resolveCanonicalToken('', HOME)).toEqual({ source: 'none' });
+    expect(resolveCanonicalToken(undefined, credPath)).toEqual({ source: 'none' });
+    expect(resolveCanonicalToken('', credPath)).toEqual({ source: 'none' });
   });
   it('NEVER reads process.env even when a stale value is present', () => {
     const prev = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'STALE-USER-SCOPE';
     try {
       // no .env token, no credential file → must be none, NOT the process.env value
-      expect(resolveCanonicalToken(undefined, HOME)).toEqual({ source: 'none' });
+      expect(resolveCanonicalToken(undefined, credPath)).toEqual({ source: 'none' });
     } finally {
       if (prev === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
       else process.env.CLAUDE_CODE_OAUTH_TOKEN = prev;
