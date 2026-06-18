@@ -10,6 +10,7 @@ import {
   shouldSendCrashLoopAlert,
   countRecentCrashes,
   writeDaemonCrashedMarkers,
+  stripDaemonClaudeOAuthEnv,
   CRASH_HISTORY_MAX,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_COOLDOWN_MS,
@@ -68,6 +69,37 @@ describe('crash history persistence', () => {
     recordCrash(ctxRoot, huge);
     const h = readCrashHistory(ctxRoot);
     expect(h.crashes[0].err.length).toBeLessThanOrEqual(2000);
+  });
+});
+
+describe('stripDaemonClaudeOAuthEnv', () => {
+  it('removes every case variant of CLAUDE_CODE_OAUTH_TOKEN without touching unrelated env', () => {
+    const env = {
+      CLAUDE_CODE_OAUTH_TOKEN: 'stale-upper',
+      claude_code_oauth_token: 'stale-lower',
+      Claude_Code_Oauth_Token: 'stale-mixed',
+      CLAUDE_CODE_OAUTH_SCOPES: 'scope',
+      PATH: 'path',
+    } as NodeJS.ProcessEnv;
+
+    const removed = stripDaemonClaudeOAuthEnv(env);
+
+    expect(removed.sort()).toEqual([
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'Claude_Code_Oauth_Token',
+      'claude_code_oauth_token',
+    ].sort());
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(env.claude_code_oauth_token).toBeUndefined();
+    expect(env.Claude_Code_Oauth_Token).toBeUndefined();
+    expect(env.CLAUDE_CODE_OAUTH_SCOPES).toBe('scope');
+    expect(env.PATH).toBe('path');
+  });
+
+  it('is a no-op when no token is present', () => {
+    const env = { PATH: 'path' } as NodeJS.ProcessEnv;
+    expect(stripDaemonClaudeOAuthEnv(env)).toEqual([]);
+    expect(env.PATH).toBe('path');
   });
 });
 

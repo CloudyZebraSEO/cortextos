@@ -64,6 +64,12 @@ export interface CheckUsageResult {
   fetched_at: string;
 }
 
+export interface OAuthTokenSource {
+  accessToken: string;
+  accountName: string;
+  source: 'accounts.json' | 'env';
+}
+
 export interface RotateResult {
   rotated: boolean;
   reason: string;
@@ -135,6 +141,31 @@ export function getActiveAccount(ctxRoot: string): { name: string; account: OAut
   return { name: store.active, account };
 }
 
+export function getAuthoritativeOAuthToken(ctxRoot: string, account?: string): OAuthTokenSource {
+  if (account) {
+    const store = loadAccounts(ctxRoot);
+    const acct = store?.accounts[account];
+    if (!acct) throw new Error(`Account "${account}" not found in accounts.json`);
+    return { accessToken: acct.access_token, accountName: account, source: 'accounts.json' };
+  }
+
+  const active = getActiveAccount(ctxRoot);
+  if (active) {
+    return {
+      accessToken: active.account.access_token,
+      accountName: active.name,
+      source: 'accounts.json',
+    };
+  }
+
+  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (envToken) {
+    return { accessToken: envToken, accountName: 'env', source: 'env' };
+  }
+
+  throw new Error('No OAuth token available (no accounts.json and CLAUDE_CODE_OAUTH_TOKEN not set)');
+}
+
 // --- Usage cache helpers ---
 
 function loadCache(ctxRoot: string): UsageCache | null {
@@ -182,28 +213,7 @@ export async function checkUsageApi(
     }
   }
 
-  // Determine which account to check
-  let accessToken: string | undefined;
-  let accountName: string;
-
-  if (opts.account) {
-    const store = loadAccounts(ctxRoot);
-    const acct = store?.accounts[opts.account];
-    if (!acct) throw new Error(`Account "${opts.account}" not found in accounts.json`);
-    accessToken = acct.access_token;
-    accountName = opts.account;
-  } else {
-    // Fall back to env / Keychain
-    const active = getActiveAccount(ctxRoot);
-    if (active) {
-      accessToken = active.account.access_token;
-      accountName = active.name;
-    } else {
-      accessToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-      accountName = 'env';
-      if (!accessToken) throw new Error('No OAuth token available (no accounts.json and CLAUDE_CODE_OAUTH_TOKEN not set)');
-    }
-  }
+  const { accessToken, accountName } = getAuthoritativeOAuthToken(ctxRoot, opts.account);
 
   const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: {

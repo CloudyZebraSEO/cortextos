@@ -10,6 +10,7 @@ vi.stubGlobal('fetch', mockFetch);
 const {
   loadAccounts,
   getActiveAccount,
+  getAuthoritativeOAuthToken,
   checkUsageApi,
   refreshOAuthToken,
   rotateOAuth,
@@ -46,6 +47,7 @@ const SAMPLE_STORE = {
 };
 
 let tmpDir: string;
+let originalClaudeToken: string | undefined;
 
 function writeStore(store = SAMPLE_STORE) {
   const { mkdirSync, writeFileSync } = require('fs');
@@ -57,9 +59,16 @@ function writeStore(store = SAMPLE_STORE) {
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'cortextos-oauth-test-'));
   mockFetch.mockReset();
+  originalClaudeToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
 });
 
 afterEach(() => {
+  if (originalClaudeToken === undefined) {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  } else {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = originalClaudeToken;
+  }
   try { rmSync(tmpDir, { recursive: true }); } catch { /* ignore */ }
 });
 
@@ -86,6 +95,46 @@ describe('getActiveAccount', () => {
     const result = getActiveAccount(tmpDir);
     expect(result?.name).toBe('primary');
     expect(result?.account.access_token).toBe('tok_primary_abc');
+  });
+});
+
+describe('getAuthoritativeOAuthToken', () => {
+  it('prefers accounts.json over a stale process env token', () => {
+    writeStore();
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'stale-user-env-token';
+
+    const result = getAuthoritativeOAuthToken(tmpDir);
+    expect(result).toEqual({
+      accessToken: 'tok_primary_abc',
+      accountName: 'primary',
+      source: 'accounts.json',
+    });
+  });
+
+  it('uses a named account from accounts.json before env', () => {
+    writeStore();
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'stale-user-env-token';
+
+    const result = getAuthoritativeOAuthToken(tmpDir, 'secondary');
+    expect(result.accessToken).toBe('tok_secondary_def');
+    expect(result.accountName).toBe('secondary');
+    expect(result.source).toBe('accounts.json');
+  });
+
+  it('falls back to env only when no accounts.json exists', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'env-token';
+
+    const result = getAuthoritativeOAuthToken(tmpDir);
+    expect(result).toEqual({
+      accessToken: 'env-token',
+      accountName: 'env',
+      source: 'env',
+    });
+  });
+
+  it('throws when no file token and daemon env has been scrubbed', () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    expect(() => getAuthoritativeOAuthToken(tmpDir)).toThrow('No OAuth token available');
   });
 });
 

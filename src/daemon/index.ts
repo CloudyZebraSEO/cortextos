@@ -11,6 +11,26 @@ import { ensureDir } from '../utils/atomic.js';
 // trips MaxListenersExceededWarning. Bump for the full fleet.
 process.setMaxListeners(20);
 
+export const CLAUDE_OAUTH_ENV_KEY = 'CLAUDE_CODE_OAUTH_TOKEN';
+
+/**
+ * The daemon may be launched via `pm2 --update-env` from an agent shell or from
+ * Windows User env. That can inject a stale Claude OAuth token into the long
+ * lived daemon process even though agent PTYs should source auth from their own
+ * files. Scrub every case variant at daemon startup so no downstream fallback
+ * can silently reuse the stale process-level token.
+ */
+export function stripDaemonClaudeOAuthEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+  const removed: string[] = [];
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === CLAUDE_OAUTH_ENV_KEY) {
+      delete env[key];
+      removed.push(key);
+    }
+  }
+  return removed;
+}
+
 // ---------------------------------------------------------------------------
 // Crash handling: turn silent daemon deaths into attributable, observable
 // events. Three responsibilities:
@@ -278,6 +298,14 @@ class Daemon {
   }
 
   async start(): Promise<void> {
+    const strippedOAuthKeys = stripDaemonClaudeOAuthEnv();
+    if (strippedOAuthKeys.length > 0) {
+      console.warn(
+        `[daemon] Scrubbed process-level ${CLAUDE_OAUTH_ENV_KEY} (${strippedOAuthKeys.join(', ')}) ` +
+        'before starting agents; Claude auth must come from authoritative agent/oauth files.',
+      );
+    }
+
     // Force restrictive default permissions for everything the daemon writes:
     // 0700 dirs, 0600 files. Belt-and-suspenders for explicit chmod calls.
     if (process.platform !== 'win32') {
