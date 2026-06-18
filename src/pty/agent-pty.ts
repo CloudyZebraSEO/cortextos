@@ -3,6 +3,13 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
+import {
+  OAUTH_TOKEN_KEY,
+  stripOAuthTokenVariants,
+  resolveCanonicalToken,
+  assertChildAuthToken,
+  redactToken,
+} from './auth-token.js';
 
 // node-pty types
 interface IPty {
@@ -110,7 +117,10 @@ export class AgentPTY {
 
     // Source agent .env file (overrides org secrets.env for same key names).
     // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
+    // We capture the .env OAuth token separately — it is the AUTHORITATIVE source
+    // of intent and is reconciled below (see auth canonicalization block).
     const agentEnvFile = join(this.env.agentDir, '.env');
+    let agentEnvToken: string | undefined;
     if (existsSync(agentEnvFile)) {
       const content = readFileSync(agentEnvFile, 'utf-8');
       for (const line of content.split('\n')) {
@@ -118,7 +128,10 @@ export class AgentPTY {
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eqIdx = trimmed.indexOf('=');
         if (eqIdx > 0) {
-          ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+          const key = trimmed.slice(0, eqIdx).trim();
+          const value = trimmed.slice(eqIdx + 1).trim();
+          ptyEnv[key] = value;
+          if (key.toUpperCase() === OAUTH_TOKEN_KEY) agentEnvToken = value;
         }
       }
     }
@@ -147,6 +160,32 @@ export class AgentPTY {
           }
         }
       } catch { /* leave unset if context.json is missing or malformed */ }
+    }
+
+    // --- Auth-token canonicalization (defense-in-depth; INCIDENT 2026-06-17) ---
+    // The agent .env token is authoritative; the Claude credential store is the
+    // explicit fallback. Strip EVERY inherited case variant of the OAuth token
+    // first so no stale daemon / User-scope value can shadow it, then set
+    // exactly one canonical key from the authoritative source. A spawn-time
+    // assertion hard-fails rather than booting an agent onto a wrong/stale token
+    // (a bad token here 401'd the whole Claude fleet for >1 day). The token is
+    // never sourced from process.env / inherited env — that was the bug vector.
+    stripOAuthTokenVariants(ptyEnv);
+    const resolvedToken = resolveCanonicalToken(agentEnvToken);
+    if (resolvedToken.token) {
+      ptyEnv[OAUTH_TOKEN_KEY] = resolvedToken.token;
+    }
+    assertChildAuthToken(ptyEnv, resolvedToken);
+    if (resolvedToken.source === 'none') {
+      console.warn(
+        `[agent-pty] ${this.env.agentName}: no authoritative Claude OAuth token ` +
+        `(no .env token, no credential store) — agent may need /login`,
+      );
+    } else {
+      console.log(
+        `[agent-pty] ${this.env.agentName}: Claude OAuth token source=${resolvedToken.source} ` +
+        `tail=${redactToken(resolvedToken.token)} (redacted, last-8 only)`,
+      );
     }
 
     // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
