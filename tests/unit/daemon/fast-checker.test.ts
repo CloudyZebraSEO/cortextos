@@ -371,22 +371,41 @@ describe('FastChecker', () => {
       expect((checker as any).telegramMessages).toHaveLength(0);
     });
 
-    it('holds queued Telegram messages while agent is active and delivers once idle', async () => {
+    it('injects a queued Telegram message IMMEDIATELY even while the agent is active (user interrupt-bypass)', async () => {
+      // Interrupt-bypass policy (af22bce): a queued Telegram message has already
+      // passed the ALLOWED_USER gate, so it is a direct message FROM THE USER and
+      // must NOT wait a full turn — it jumps the active-turn hold. (Background
+      // inbox/cron traffic still waits — see the next two tests, the fence.)
       const agent = createMockAgent();
       const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.queueTelegramMessage('held\n');
-      (checker as any).lastMessageInjectedAt = Date.now();
+      checker.queueTelegramMessage('interrupt\n');
+      (checker as any).lastMessageInjectedAt = Date.now(); // agent mid-turn / active
 
-      await (checker as any).pollCycle();
-      expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
-      expect((checker as any).telegramMessages.map((m: any) => m.formatted)).toEqual(['held\n']);
-
-      writeFileSync(join(paths.stateDir, 'last_idle.flag'), String(Math.floor(Date.now() / 1000) + 1));
       await (checker as any).pollCycle();
 
       expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
-      expect(agent.injectMessageDetailed.mock.calls[0][0]).toBe('held\n');
+      expect(agent.injectMessageDetailed.mock.calls[0][0]).toBe('interrupt\n');
       expect((checker as any).telegramMessages).toHaveLength(0);
+    });
+
+    it('FENCE: a user Telegram interrupt injects mid-turn but background inbox traffic STILL holds', async () => {
+      // The interrupt-bypass must inject ONLY the Telegram message and leave inbox
+      // (agent-to-agent / background) queued — background traffic must never preempt
+      // the user's live turn. If someone ever lets inbox/cron jump the hold too,
+      // this fails.
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('user-interrupt\n');
+      writeInboxMessage(paths, 'bg1', 'background agent message');
+      (checker as any).lastMessageInjectedAt = Date.now(); // active
+
+      await (checker as any).pollCycle();
+
+      // Telegram injected (interrupt) — and exactly once, NOT bundled with inbox.
+      expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
+      expect(agent.injectMessageDetailed.mock.calls[0][0]).toBe('user-interrupt\n');
+      // Inbox message HELD (still in inbox, not moved to inflight/processed).
+      expect(existsSync(join(paths.inbox, '2-1781320000000-from-atlas-bg1.json'))).toBe(true);
     });
 
     it('does not move inbox messages to inflight while active; ACKs only after idle delivery', async () => {
